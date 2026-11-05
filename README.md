@@ -57,6 +57,8 @@ python -m venv .venv
 Linux/macOS 使用 `python3 -m venv .venv`、`source .venv/bin/activate` 后运行相同的 pip/CLI 命令。
 请使用独立环境，不要启用 `--system-site-packages`，以避免继承系统 Anaconda 的数值运行库冲突。
 下面的 `python` 均指已安装本项目的环境；Windows 也可以直接使用 `.\.venv\Scripts\python.exe`。
+本次已完成验证的本地环境是 `.venv-cpu`，可直接使用 `.\.venv-cpu\Scripts\python.exe`。
+迁移项目时重新创建虚拟环境，不复制 `.venv` 或 `.venv-cpu`。
 
 ## 一次运行完整闭环
 
