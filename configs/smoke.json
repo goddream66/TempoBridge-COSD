@@ -1,0 +1,6 @@
+{
+  "model": {"dim": 32, "depth": 3, "protected_depth": 1, "heads": 4, "patch_size": 10, "stem_width": 8, "ff_multiplier": 2},
+  "data": {"ppg_fs": 100, "ecg_fs": 100, "scales_seconds": [1.0, 2.0], "quality_edges": [0.33, 0.67]},
+  "train": {"epochs": 2, "batch_size": 12, "accumulation": 1, "lr": 0.001, "device": "cpu", "threads": 2},
+  "calibration": {"folds": 3, "probe": "consensus", "min_subjects_per_bin": 2, "mlp_steps": 40, "mlp_hidden": 16}
+}

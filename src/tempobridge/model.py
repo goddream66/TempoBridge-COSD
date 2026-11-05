@@ -1,0 +1,187 @@
+"""Independent RMSNorm/RoPE/SwiGLU encoder; not Mantis checkpoint-compatible.
+
+No ECG tensor occurs in this module's public inference interface.
+Patch-local convolution and visible-only normalization prevent masked-target leakage.
+"""
+
+from dataclasses import asdict
+
+import torch
+from torch import Tensor, nn
+from torch.nn import functional as F
+
+from .config import ModelConfig
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        y = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + 1e-6)
+        return y.to(x.dtype) * self.weight
+
+
+def rotary(x: Tensor) -> Tensor:
+    """Rotary position embedding on the time axis [B,H,N,D]."""
+    n, d = x.shape[-2:]
+    frequency = torch.exp(
+        -torch.arange(0, d, 2, device=x.device, dtype=torch.float32)
+        * (torch.log(torch.tensor(10000.0, device=x.device)) / d)
+    )
+    phase = torch.arange(n, device=x.device, dtype=torch.float32)[:, None] * frequency
+    a, b = x[..., 0::2].float(), x[..., 1::2].float()
+    c, s = phase.cos(), phase.sin()
+    return torch.stack((a * c - b * s, a * s + b * c), -1).flatten(-2).to(x.dtype)
+
+
+class Block(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.heads, self.dropout = cfg.heads, cfg.dropout
+        self.norm1, self.norm2 = RMSNorm(cfg.dim), RMSNorm(cfg.dim)
+        self.qkv = nn.Linear(cfg.dim, 3 * cfg.dim, bias=False)
+        self.out = nn.Linear(cfg.dim, cfg.dim, bias=False)
+        hidden = cfg.dim * cfg.ff_multiplier
+        self.up = nn.Linear(cfg.dim, 2 * hidden, bias=False)
+        self.down = nn.Linear(hidden, cfg.dim, bias=False)
+
+    def forward(self, x):
+        b, n, d = x.shape
+        q, k, v = self.qkv(self.norm1(x)).view(b, n, 3, self.heads, d // self.heads).unbind(2)
+        q, k, v = (a.transpose(1, 2) for a in (q, k, v))
+        y = F.scaled_dot_product_attention(
+            rotary(q), rotary(k), v,
+            dropout_p=self.dropout if self.training else 0.0,
+        ).transpose(1, 2).reshape(b, n, d)
+        x = x + F.dropout(self.out(y), self.dropout, self.training)
+        a, gate = self.up(self.norm2(x)).chunk(2, -1)
+        return x + F.dropout(self.down(a * F.silu(gate)), self.dropout, self.training)
+
+
+class PatchStem(nn.Module):
+    """Every patch is convolved independently, including at patch boundaries."""
+    def __init__(self, cfg):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv1d(1, cfg.stem_width, 5, padding=2), nn.GELU(),
+            nn.Conv1d(cfg.stem_width, cfg.stem_width, 3, padding=1), nn.GELU(),
+        )
+        self.projection = nn.Linear(cfg.stem_width + 2, cfg.dim)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, cfg.dim))
+        nn.init.normal_(self.mask_token, std=0.02)
+
+    def forward(self, patches, mask):
+        b, n, p = patches.shape
+        safe = patches.masked_fill(mask[..., None], 0.0)
+        local = self.conv(safe.reshape(b * n, 1, p)).mean(-1).reshape(b, n, -1)
+        stats = torch.stack((safe.mean(-1), safe.std(-1, correction=0)), -1)
+        tokens = self.projection(torch.cat((local, stats), -1))
+        return torch.where(mask[..., None], self.mask_token, tokens)
+
+
+class TempoBridge(nn.Module):
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.config = config
+        self.stem = PatchStem(config)
+        self.shallow = nn.ModuleList([Block(config) for _ in range(config.protected_depth)])
+        self.context = nn.ModuleList(
+            [Block(config) for _ in range(config.depth - config.protected_depth)]
+        )
+        self.context_norm = RMSNorm(config.dim)
+        self.morphology = nn.Sequential(
+            nn.LayerNorm(config.dim), nn.Linear(config.dim, config.dim), nn.GELU(),
+            nn.Linear(config.dim, config.dim),
+        ) if config.morphology_branch else nn.Identity()
+        self.morph_norm = RMSNorm(config.dim)
+        self.reconstruction = nn.Linear(config.dim, config.patch_size)
+        self.morph_reconstruction = nn.Linear(config.dim, config.patch_size)
+
+    @property
+    def feature_dim(self):
+        return 2 * self.config.dim if self.config.morphology_branch else self.config.dim
+
+    def prepare(self, x: Tensor, mask: Tensor | None = None):
+        if x.ndim != 3 or x.shape[1] != 1:
+            raise ValueError("Expected [batch, 1, time] single-lead waveform")
+        p = self.config.patch_size
+        if x.shape[-1] % p or x.shape[-1] < 2 * p:
+            raise ValueError("Length must be a multiple of patch_size and contain >=2 patches")
+        if not torch.isfinite(x).all():
+            raise ValueError("Waveforms must be finite; mark missing ECG separately")
+        raw = x.float().reshape(x.shape[0], -1, p)
+        if mask is None:
+            mask = torch.zeros(raw.shape[:2], device=x.device, dtype=torch.bool)
+        if mask.shape != raw.shape[:2] or mask.dtype != torch.bool:
+            raise ValueError("mask must be boolean [batch, patches], True = hidden")
+        visible = (~mask)[..., None].expand_as(raw)
+        count = visible.sum((1, 2), keepdim=True)
+        if (count == 0).any():
+            raise ValueError("At least one patch must remain visible")
+        mean = raw.masked_fill(~visible, 0).sum((1, 2), keepdim=True) / count
+        variance = ((raw - mean).square().masked_fill(~visible, 0)).sum(
+            (1, 2), keepdim=True
+        ) / count
+        scale = variance.sqrt().clamp_min(1e-4)
+        target = (raw - mean) / scale
+        return self.stem(target, mask), target, mask
+
+    def encode(self, x, mask=None, detach_shallow=False):
+        h, target, mask = self.prepare(x, mask)
+        for block in self.shallow:
+            h = block(h)
+        morph = self.morph_norm(h + self.morphology(h))
+        context = h.detach() if detach_shallow else h
+        for block in self.context:
+            context = block(context)
+        context = self.context_norm(context)
+        return {"morphology": morph, "context": context, "target": target, "mask": mask}
+
+    def forward_features(self, x):
+        result = self.encode(x)
+        c = result["context"].mean(1)
+        m = result["morphology"].mean(1)
+        z = torch.cat((m, c), -1) if self.config.morphology_branch else c
+        return {"embedding": z, "context": c, "morphology": m,
+                "tokens": result["context"]}
+
+    def forward(self, ppg):
+        return self.forward_features(ppg)["embedding"]
+
+    def model_config(self):
+        return asdict(self.config)
+
+
+def random_mask(x, patch_size, ratio, generator=None):
+    n = x.shape[-1] // patch_size
+    count = min(n - 1, max(1, round(n * ratio)))
+    ranks = torch.rand(x.shape[0], n, generator=generator, device=x.device).argsort(-1)
+    mask = torch.zeros(x.shape[0], n, dtype=torch.bool, device=x.device)
+    return mask.scatter_(1, ranks[:, :count], True)
+
+
+def reconstruction_loss(model, waveform, mask, morphology_weight=0.25):
+    result = model.encode(waveform, mask)
+    target = result["target"].detach()
+    if not mask.any():
+        raise ValueError("Reconstruction requires at least one hidden patch")
+    context = F.smooth_l1_loss(model.reconstruction(result["context"])[mask], target[mask])
+    if model.config.morphology_branch:
+        morph = F.smooth_l1_loss(model.morph_reconstruction(result["morphology"])[mask], target[mask])
+    else:
+        morph = context * 0
+    return context + morphology_weight * morph
+
+
+class TransferHeads(nn.Module):
+    def __init__(self, dim, target_dim, scales):
+        super().__init__()
+        self.heads = nn.ModuleList([
+            nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, dim), nn.GELU(),
+                          nn.Linear(dim, target_dim)) for _ in scales
+        ])
+
+    def forward(self, tokens, scale_index):
+        return self.heads[scale_index](tokens.mean(1))
