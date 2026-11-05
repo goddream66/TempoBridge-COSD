@@ -54,6 +54,8 @@ python -m venv .venv
 
 上述安装用于 CPU 跑通验证。实际服务器训练时按服务器硬件另行安装合适的 CUDA 版 PyTorch。
 仓库不要求 D 盘或特定用户目录，所有数据、输出和 checkpoint 路径均为 CLI 参数。
+Linux/macOS 使用 `python3 -m venv .venv`、`source .venv/bin/activate` 后运行相同的 pip/CLI 命令。
+请使用独立环境，不要启用 `--system-site-packages`，以避免继承系统 Anaconda 的数值运行库冲突。
 下面的 `python` 均指已安装本项目的环境；Windows 也可以直接使用 `.\.venv\Scripts\python.exe`。
 
 ## 一次运行完整闭环

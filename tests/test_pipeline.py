@@ -112,3 +112,20 @@ def test_feature_cli_does_not_access_ecg(tmp_path, tiny_config):
     output = extract_features(exported, only_test, tmp_path / "features.npz")
     with np.load(output) as data:
         assert np.isfinite(data["embedding"]).all()
+
+
+def test_distillation_resume_restores_prediction_heads(tmp_path, tiny_config):
+    manifest = make_synthetic(tmp_path / "data", subjects=10, windows=3, seconds=2)
+    ppg = train(tiny_config, manifest, tmp_path / "ppg", stop_after=1)
+    ecg = train(tiny_config, manifest, tmp_path / "ecg", modality="ecg", stop_after=1)
+    artifact = tmp_path / "calibration.json"
+    calibrate(tiny_config, manifest, ppg, ecg, artifact)
+    tiny_config.train.transfer_mode = "all"  # Exercise every available teacher target.
+    kwargs = dict(student_path=ppg, teacher_path=ecg, calibration_path=artifact)
+    full = train(tiny_config, manifest, tmp_path / "full", **kwargs)
+    partial = train(tiny_config, manifest, tmp_path / "resume", stop_after=1, **kwargs)
+    resumed = train(tiny_config, manifest, tmp_path / "resume", resume=partial, **kwargs)
+    a, b = load_checkpoint(full), load_checkpoint(resumed)
+    for group in ("model", "heads"):
+        for key in a[group]:
+            torch.testing.assert_close(a[group][key], b[group][key], rtol=0, atol=0)
