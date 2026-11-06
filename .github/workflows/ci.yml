@@ -9,7 +9,7 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
-      - run: pip install -e '.[dev]'
+      - run: pip install -e '.[dev,data]'
       - run: ruff check .
       - run: pytest -q
       - run: python scripts/smoke.py --output runs/ci-smoke

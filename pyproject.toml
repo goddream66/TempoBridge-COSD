@@ -11,6 +11,7 @@ dependencies = ["torch>=2.4", "numpy>=1.24", "scipy>=1.10"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.9", "build>=1"]
+data = ["h5py>=3.9", "wfdb>=4.1", "vitaldb>=1.6"]
 
 [project.scripts]
 tempobridge = "tempobridge.cli:main"

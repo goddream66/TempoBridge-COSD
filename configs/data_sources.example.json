@@ -1,0 +1,6 @@
+{
+  "sources": {
+    "mimic": {"root": "../data/processed/mimic", "pattern": "*.h5", "fs": 50},
+    "vitaldb": {"root": "../data/processed/vitaldb", "pattern": "*.h5", "fs": 50}
+  }
+}

@@ -49,7 +49,7 @@ Python >= 3.10，PyTorch >= 2.4。请先按硬件安装 PyTorch，再安装项�
 cd TempoBridge_backbone
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+.\.venv\Scripts\python.exe -m pip install -e ".[dev,data]"
 ```
 
 上述安装用于 CPU 跑通验证。实际服务器训练时按服务器硬件另行安装合适的 CUDA 版 PyTorch。
@@ -76,7 +76,9 @@ smoke 自动执行：合成数据 → 数据审计 → PPG 预热 → ECG 预训
 
 ## 使用自己的同步数据
 
-先按 [数据约定](docs/DATA.md) 准备 CSV manifest 和 NPZ 波形。必须先按患者划分训练/验证/测试。
+已有 PulseBound HDF5、原始 MIMIC WFDB 或本地 VitalDB `.vital`，先按
+[PulseBound 数据接入指南](docs/PULSEBOUND_DATA.md) 转换/建立索引，使用 `configs/pulsebound_50hz.json`。
+也可继续按 [数据约定](docs/DATA.md) 准备 CSV manifest 和 NPZ 波形，并预先按患者划分训练/验证/测试。
 
 ```powershell
 python -m tempobridge audit-data --config configs/base.json --manifest data/manifest.csv
@@ -152,7 +154,8 @@ docs/               数学说明、研究定位、数据/教师接口、验证�
 .github/            CI、issue 和 PR 模板
 ```
 
-本版本支持单机单 GPU/CPU、AMP、梯度累积和按需 NPZ 读取；尚未实现 DDP、多节点及超大规模分片存储。
+本版本支持单机单 GPU/CPU、AMP、梯度累积、按需 NPZ/HDF5 读取、紧凑分组索引和无放回来源混合采样；
+尚未实现 DDP、多节点及大规模真实数据吞吐验证。
 `scripts/benchmark.py` 是可选的前向/反向性能测量工具，本次不执行 GPU benchmark。
 它是可实验的研究基座，不是已经完成真实数据预训练的成品基础模型。
 

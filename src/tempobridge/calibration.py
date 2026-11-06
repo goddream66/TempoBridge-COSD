@@ -10,10 +10,11 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
-from .data import PairedDataset, manifest_digest, read_manifest
+from .data import PairedDataset, manifest_digest, read_manifest, subject_ids
 from .model import ModelConfig, TempoBridge
+from .sampling import calibration_indices
 from .teacher import FrozenTeacher
 from .utils import device_for, file_sha256, load_checkpoint, seed_all, write_json
 
@@ -52,11 +53,15 @@ def fit_probe(x_train, y_train, x_test, subjects_train, config, kind, seed):
             tx, ty, tw = (torch.tensor(z, dtype=torch.float32) for z in (x, y, weights))
             for _ in range(config.mlp_steps):
                 optimizer.zero_grad(set_to_none=True)
-                loss = ((net(tx) - ty).square().mean(-1) * tw).mean()
+                # Uniform minibatches retain the subject-balanced weighted objective.
+                indices = (torch.randint(len(tx), (config.probe_batch_size,))
+                           if len(tx) > config.probe_batch_size else slice(None))
+                loss = ((net(tx[indices]) - ty[indices]).square().mean(-1) * tw[indices]).mean()
                 loss.backward()
                 optimizer.step()
             with torch.no_grad():
-                prediction = net(torch.tensor(xt, dtype=torch.float32)).numpy()
+                prediction = np.concatenate([net(chunk).numpy() for chunk in
+                    torch.tensor(xt, dtype=torch.float32).split(config.probe_batch_size)])
     return prediction * ys + ym, ym, ys
 
 
@@ -117,7 +122,8 @@ def calibrate(config, manifest, student_path, teacher_path, output, teacher_kind
     if Path(output).exists():
         raise FileExistsError("Calibration output exists; choose a new artifact path")
     seed_all(config.train.seed, config.train.threads)
-    records = read_manifest(manifest)
+    config.validate()
+    records = read_manifest(manifest, data_config=config.data)
     digest = manifest_digest(records)
     checkpoint = load_checkpoint(student_path)
     if checkpoint.get("modality") != "ppg" or checkpoint.get("global_step", 0) < 1:
@@ -133,13 +139,16 @@ def calibrate(config, manifest, student_path, teacher_path, output, teacher_kind
     teacher = FrozenTeacher(teacher_path, teacher_kind).to(device)
     teacher.verify_data(records, config.data.ecg_fs)
     dataset = PairedDataset(records, config.data, augment=False)
-    loader = DataLoader(dataset, batch_size=config.train.batch_size, shuffle=False,
+    indices = calibration_indices(dataset.records, config.calibration.max_windows_per_subject,
+                                  config.train.seed)
+    loader = DataLoader(Subset(dataset, indices), batch_size=config.train.batch_size, shuffle=False,
                         num_workers=config.data.workers)
     features, targets = [[] for _ in config.data.scales_seconds], [[] for _ in config.data.scales_seconds]
     subjects, qualities = [], []
     with torch.inference_mode():
         for batch in loader:
-            valid = batch["ecg_valid"] & (batch["ecg_quality"] >= config.calibration.min_ecg_quality)
+            valid = (batch["subject_known"] & batch["ecg_valid"] &
+                     (batch["ecg_quality"] >= config.calibration.min_ecg_quality))
             if not valid.any():
                 continue
             subjects.extend(np.asarray(batch["subject_id"])[valid.numpy()].tolist())
@@ -148,6 +157,7 @@ def calibrate(config, manifest, student_path, teacher_path, output, teacher_kind
                 x, e = batch["ppg"][s][valid].to(device), batch["ecg"][s][valid].to(device)
                 features[s].append(model(x).cpu().numpy())
                 targets[s].append(teacher(e).cpu().numpy())
+    dataset.close()
     if not subjects:
         raise ValueError("No reliable paired ECG for calibration")
     reports = [crossfit_scale(np.concatenate(x), np.concatenate(y), subjects, qualities,
@@ -156,7 +166,10 @@ def calibrate(config, manifest, student_path, teacher_path, output, teacher_kind
     result = {
         "schema_version": 1, "student_sha256": file_sha256(student_path),
         "teacher_sha256": teacher.fingerprint, "teacher_kind": teacher_kind,
-        "manifest_sha256": digest, "train_subjects": sorted({r.subject_id for r in records if r.split == "train"}),
+        "manifest_sha256": digest, "train_subjects": sorted(subject_ids(records, "train")),
+        "selection": {"seed": config.train.seed, "candidates": len(indices),
+                      "reliable_pairs": len(subjects), "unknown_ids_excluded": True,
+                      "max_windows_per_subject": config.calibration.max_windows_per_subject},
         "scales_seconds": config.data.scales_seconds, "ppg_fs": config.data.ppg_fs,
         "ecg_fs": config.data.ecg_fs, "quality_edges": config.data.quality_edges,
         "calibration_config": config.to_dict()["calibration"],

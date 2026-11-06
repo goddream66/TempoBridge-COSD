@@ -37,6 +37,12 @@ class DataConfig:
     scales_seconds: list[float] = field(default_factory=lambda: [2.0, 8.0])
     quality_edges: list[float] = field(default_factory=lambda: [0.33, 0.67])
     workers: int = 0
+    source_roots: dict[str, str] = field(default_factory=dict)
+    integrity: str = "sha256"
+    max_open_shards: int = 4
+    source_weights: dict[str, float] = field(default_factory=dict)
+    samples_per_epoch: int = 0
+    shuffle_block_size: int = 256
 
 
 @dataclass
@@ -70,6 +76,8 @@ class CalibrationConfig:
     mlp_hidden: int = 64
     mlp_steps: int = 200
     mlp_lr: float = 0.001
+    max_windows_per_subject: int = 16
+    probe_batch_size: int = 2048
 
 
 @dataclass
@@ -83,6 +91,10 @@ class ExperimentConfig:
         d, t, c = self.data, self.train, self.calibration
         if d.ppg_fs <= 0 or d.ecg_fs <= 0 or d.workers < 0:
             raise ValueError("Invalid sample rates/workers")
+        if d.integrity not in {"sha256", "metadata"} or d.max_open_shards < 1 or d.shuffle_block_size < 1:
+            raise ValueError("Invalid HDF5 integrity/cache/shuffle settings")
+        if d.samples_per_epoch < 0 or any(not 0 < w < float("inf") for w in d.source_weights.values()):
+            raise ValueError("Invalid epoch size or source weights")
         if not d.scales_seconds or len(set(d.scales_seconds)) != len(d.scales_seconds):
             raise ValueError("Scales must be nonempty and unique")
         for s in d.scales_seconds:
@@ -116,6 +128,8 @@ class ExperimentConfig:
             raise ValueError("Unknown probe")
         if c.mlp_steps < 1 or c.mlp_hidden < 1 or c.mlp_lr <= 0:
             raise ValueError("Invalid MLP probe")
+        if c.max_windows_per_subject < 1 or c.probe_batch_size < 1:
+            raise ValueError("Calibration sample/batch bounds must be positive")
         if not 0 <= c.min_ecg_quality <= 1:
             raise ValueError("min_ecg_quality must be in [0,1]")
         return self

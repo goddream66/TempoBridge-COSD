@@ -21,6 +21,28 @@ def main(argv=None):
     p = sub.add_parser("audit-data", help="Validate manifest identities and signal shapes")
     p.add_argument("--manifest", required=True)
     p.add_argument("--config", required=True)
+    p.add_argument("--max-windows", type=int, default=32,
+                   help="Waveforms checked per split (0 = all); all shard hashes are verified by default")
+    p = sub.add_parser("preprocess", help="Convert local MIMIC WFDB or VitalDB .vital to synchronized HDF5")
+    p.add_argument("--kind", choices=["mimic", "vitaldb"], required=True)
+    p.add_argument("--input-root", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--source")
+    p.add_argument("--id-map", help="CSV: record_path,subject_id,case_id")
+    p.add_argument("--resume", action="store_true")
+    p.add_argument("--max-records", type=int)
+    p.add_argument("--target-fs", type=int, default=50)
+    p.add_argument("--window-seconds", type=float, default=30)
+    p.add_argument("--quality-patch-seconds", type=float, default=1)
+    p.add_argument("--max-missing-fraction", type=float, default=0.2)
+    p.add_argument("--windows-per-shard", type=int, default=50000)
+    p.add_argument("--max-windows-per-record", type=int, default=200, help="0 = unlimited")
+    p.add_argument("--ppg-channel")
+    p.add_argument("--ecg-channel")
+    p = sub.add_parser("index-h5", help="Index existing shards with PulseBound source/group split protocol")
+    p.add_argument("--sources", required=True, help="JSON source roots, patterns and optional sample rates")
+    p.add_argument("--output", required=True)
+    p.add_argument("--pulsebound-split", help="Verify/reuse an original group_split_manifest.json")
     for name in ("pretrain", "distill", "calibrate"):
         p = sub.add_parser(name)
         p.add_argument("--config", required=True)
@@ -50,17 +72,36 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.command == "synthetic":
         result = make_synthetic(args.output, args.subjects, args.windows, args.seconds, args.fs, args.seed)
+    elif args.command == "preprocess":
+        from .preprocess import PreprocessConfig, preprocess_raw
+        config = PreprocessConfig(**{name: getattr(args, name) for name in PreprocessConfig.__dataclass_fields__})
+        result = json.dumps(preprocess_raw(args.kind, args.input_root, args.output, config,
+                                          args.source, args.id_map, args.resume, args.max_records))
+    elif args.command == "index-h5":
+        from .h5data import build_h5_manifest
+        result = build_h5_manifest(args.sources, args.output, args.pulsebound_split)
+        result = json.dumps({"output": args.output, "sha256": result["manifest_sha256"],
+                             "sources": list(result["sources"])})
     elif args.command == "audit-data":
-        from .data import PairedDataset
+        import random
+
+        from .data import PairedDataset, split_size, subject_ids
         cfg = ExperimentConfig.load(args.config)
-        records = read_manifest(args.manifest)
+        if args.max_windows < 0:
+            raise ValueError("max-windows must be nonnegative")
+        records = read_manifest(args.manifest, data_config=cfg.data)
         counts = {}
         for split in ("train", "val", "test"):
-            if any(r.split == split for r in records):
+            if split_size(records, split):
                 dataset = PairedDataset(records, cfg.data, split=split, augment=False)
-                missing = sum(not dataset[i]["ecg_valid"] for i in range(len(dataset)))
-                counts[split] = {"samples": len(dataset), "missing_ecg": missing,
-                                 "subjects": len({r.subject_id for r in dataset.records})}
+                indices = (range(len(dataset)) if not args.max_windows else
+                           random.Random(cfg.train.seed).sample(range(len(dataset)),
+                                                               min(args.max_windows, len(dataset))))
+                missing = sum(not dataset[i]["ecg_valid"] for i in indices)
+                counts[split] = {"samples": len(dataset), "checked_windows": len(indices),
+                                 "missing_ecg_in_checked_windows": missing,
+                                 "known_groups": len(subject_ids(records, split))}
+                dataset.close()
         result = json.dumps(counts)
     elif args.command == "calibrate":
         artifact = calibrate(ExperimentConfig.load(args.config), args.manifest, args.student,

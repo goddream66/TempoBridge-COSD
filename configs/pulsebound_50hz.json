@@ -1,0 +1,16 @@
+{
+  "model": {"patch_size": 10},
+  "data": {
+    "ppg_fs": 50,
+    "ecg_fs": 50,
+    "scales_seconds": [2.0, 8.0],
+    "workers": 0,
+    "integrity": "sha256",
+    "max_open_shards": 4,
+    "source_weights": {"mimic": 0.8, "vitaldb": 0.2},
+    "samples_per_epoch": 0,
+    "shuffle_block_size": 256
+  },
+  "train": {"device": "cpu", "precision": "fp32"},
+  "calibration": {"max_windows_per_subject": 16, "probe_batch_size": 2048}
+}

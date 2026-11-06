@@ -12,8 +12,9 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
 from .calibration import CalibrationWeights
-from .data import PairedDataset, manifest_digest, read_manifest
+from .data import PairedDataset, manifest_digest, read_manifest, split_size, subject_ids
 from .model import TempoBridge, TransferHeads, random_mask, reconstruction_loss
+from .sampling import SourceBlockSampler
 from .teacher import FrozenTeacher
 from .utils import (
     device_for,
@@ -84,7 +85,7 @@ def batch_loss(config, model, batch, device, modality, heads=None, teacher=None,
 
 @torch.inference_mode()
 def evaluate_reconstruction(config, model, records, device, modality="ppg"):
-    if not any(r.split == "val" for r in records):
+    if not split_size(records, "val"):
         return None
     dataset = PairedDataset(records, config.data, split="val", seed=config.train.seed, augment=False)
     loader = DataLoader(dataset, batch_size=config.train.batch_size, num_workers=config.data.workers)
@@ -102,6 +103,7 @@ def evaluate_reconstruction(config, model, records, device, modality="ppg"):
             losses.append(reconstruction_loss(model, wave, mask, config.train.morphology_loss_weight))
         total += float(torch.stack(losses).mean()) * int(keep.sum())
         count += int(keep.sum())
+    dataset.close()
     return total / count if count else None
 
 
@@ -110,7 +112,7 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
     config.validate()
     seed_all(config.train.seed, config.train.threads)
     device = device_for(config.train.device)
-    records = read_manifest(manifest)
+    records = read_manifest(manifest, data_config=config.data)
     digest = manifest_digest(records)
     output = Path(output)
     if (output / "last.pt").exists() and resume is None:
@@ -144,9 +146,16 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
         if config.train.transfer_mode == "calibrated" and not (calibrator.weights > 0).any():
             print("NOTICE: all calibrated weights are zero; retaining PPG self-supervision only.", flush=True)
     dataset = PairedDataset(records, config.data, seed=config.train.seed)
+    use_block_sampler = hasattr(dataset.records, "segments") or bool(config.data.source_weights)
+    sampler = (SourceBlockSampler(dataset.records, config.data, config.train.batch_size,
+                                  config.train.accumulation, config.train.seed)
+               if use_block_sampler else None)
+    if config.data.samples_per_epoch and not use_block_sampler:
+        raise ValueError("samples_per_epoch requires explicit source_weights")
     parameters = list(model.parameters()) + (list(heads.parameters()) if heads else [])
     optimizer = torch.optim.AdamW(parameters, lr=config.train.lr, weight_decay=config.train.weight_decay)
-    steps_per_epoch = math.ceil(math.ceil(len(dataset) / config.train.batch_size) / config.train.accumulation)
+    epoch_size = len(sampler) if sampler is not None else len(dataset)
+    steps_per_epoch = math.ceil(math.ceil(epoch_size / config.train.batch_size) / config.train.accumulation)
     total_steps = config.train.epochs * steps_per_epoch
     warmup = round(total_steps * config.train.warmup_fraction)
 
@@ -179,11 +188,15 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
     write_json(output / "environment.json", environment())
     write_json(output / "provenance.json", {**provenance, "manifest_sha256": digest,
                "stage": stage, "modality": modality,
-               "train_subjects": sorted({r.subject_id for r in records if r.split == "train"})})
+               "train_subjects": sorted(subject_ids(records, "train")),
+               "epoch_source_counts": sampler.counts if sampler is not None else None})
     for epoch in range(first_epoch, config.train.epochs):
         started = time.monotonic()
         dataset.set_epoch(epoch)
-        loader = DataLoader(dataset, batch_size=config.train.batch_size, shuffle=True,
+        if sampler is not None:
+            sampler.epoch = epoch
+        loader = DataLoader(dataset, batch_size=config.train.batch_size,
+                            shuffle=sampler is None, sampler=sampler,
                             generator=torch.Generator().manual_seed(config.train.seed + epoch),
                             num_workers=config.data.workers, pin_memory=device.type == "cuda")
         model.train()
@@ -227,7 +240,7 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
             "scaler": scaler.state_dict(), "stage": stage, "modality": modality,
             "epoch": epoch, "global_step": global_step, "best_val": best,
             "manifest_sha256": digest, "provenance": provenance,
-            "train_subjects": sorted({r.subject_id for r in records if r.split == "train"}),
+            "train_subjects": sorted(subject_ids(records, "train")),
             "rng_cpu": torch.get_rng_state(),
             "rng_cuda": torch.cuda.get_rng_state_all() if device.type == "cuda" else [],
         }
@@ -244,4 +257,5 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
             break
     if teacher and (teacher.training or any(p.requires_grad for p in teacher.parameters())):
         raise RuntimeError("Teacher freeze invariant violated")
+    dataset.close()
     return output / "last.pt"

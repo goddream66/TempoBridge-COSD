@@ -15,3 +15,15 @@ Design references inspected on 2026-11-05:
 
 The project name is a working research name, not a claim of global naming uniqueness.
 See docs/RESEARCH.md for related-work overlap and limits of novelty claims.
+
+Data compatibility reference inspected on 2026-11-06:
+
+- Supplied PulseBound `preprocessing/processor.py`, `preprocessing/quality.py`,
+  `preprocessing/physio_extractors.py`, `v6/group_split.py`, and `v6/data.py`.
+  The identifier normalization, hash namespaces, default split salt, ranking and
+  90/5/5 integer apportionment protocol are reproduced for wire compatibility.
+  These protocol constants and formulas are not claimed as original contributions.
+  No upstream source files or clinical datasets are bundled. See docs/PULSEBOUND_DATA.md
+  for deliberate cleaning differences and limits of the new VitalDB converter.
+- WFDB official I/O documentation: https://wfdb.readthedocs.io/en/latest/io.html
+- VitalDB official local-file library: https://github.com/vitaldb/vitalutils

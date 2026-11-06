@@ -1,5 +1,8 @@
 # 数据格式
 
+原始 MIMIC WFDB、VitalDB `.vital` 及已处理 PulseBound HDF5 的转换、清洗、90/5/5 划分与命令见
+[PulseBound 数据接入](PULSEBOUND_DATA.md)。下文保留原 CSV + NPZ 接口，两种 manifest 均能进入同一训练流程。
+
 CSV 必需列：
 
 ```csv
@@ -43,5 +46,6 @@ ECG 很短但 PPG 很长时，先在预处理阶段明确切成同步部分和 P
 
 样本按需读取，不一次加载全部波形。相同记录每个 epoch 会重新读取和重采样；真实大规模训练建议预先转为目标采样率。
 不要将几小时记录作为每个 item；建议离线生成能覆盖最大尺度的适中窗口，保留原 recording_id。
-校准阶段会在内存中收集表征而非波形，成本随训练窗口数量线性增长。大规模运行前规划 RAM；
-当前实现不承诺千万级窗口的 out-of-core 校准。
+校准阶段每个已知训练组最多抽取 `calibration.max_windows_per_subject` 个窗口（默认 16），
+再筛选可用 ECG，并在内存中收集表征而非波形。内存随组数 × 每组上限增长；
+MLP 探针使用受 `probe_batch_size` 限制的训练批。尚未实现完全磁盘流式校准。

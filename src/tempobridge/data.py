@@ -28,10 +28,21 @@ class Record:
     path: Path
     ppg_quality: float
     ecg_quality: float
+    h5_row: int | None = None
+    source: str = "default"
+    subject_known: bool = True
+    stored_fs: float | None = None
 
 
-def read_manifest(path, check_files=True, require_train=True):
+def read_manifest(path, check_files=True, require_train=True, data_config=None):
     path = Path(path).resolve()
+    if path.suffix.lower() == ".json":
+        from .h5data import H5RecordIndex
+        config = data_config or DataConfig()
+        index = H5RecordIndex(path, config.source_roots, config.integrity)
+        if require_train and not index.counts["train"]:
+            raise ValueError("No training rows in HDF5 manifest")
+        return index
     with path.open(encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         required = {"sample_id", "subject_id", "recording_id", "split", "path"}
@@ -72,6 +83,8 @@ def read_manifest(path, check_files=True, require_train=True):
 
 def manifest_digest(records):
     """Bind artifacts to content, IDs and split assignments, independently of location."""
+    if hasattr(records, "digest"):
+        return records.digest
     digest = hashlib.sha256()
     for r in sorted(records, key=lambda r: r.sample_id):
         digest.update(json.dumps([r.sample_id, r.subject_id, r.recording_id, r.split,
@@ -80,6 +93,20 @@ def manifest_digest(records):
             while chunk := handle.read(1024 * 1024):
                 digest.update(chunk)
     return digest.hexdigest()
+
+
+def split_records(records, split):
+    return records.subset(split) if hasattr(records, "subset") else [r for r in records if r.split == split]
+
+
+def split_size(records, split):
+    return records.counts[split] if hasattr(records, "counts") else sum(r.split == split for r in records)
+
+
+def subject_ids(records, split):
+    if hasattr(records, "subjects"):
+        return records.subjects(split)
+    return {r.subject_id for r in records if r.split == split and r.subject_known}
 
 
 def read_signal(container, key, target_fs):
@@ -106,9 +133,11 @@ def read_signal(container, key, target_fs):
 class PairedDataset(Dataset):
     def __init__(self, records, config: DataConfig, split="train", seed=42, augment=True,
                  include_ecg=True):
-        self.records = [r for r in records if r.split == split]
+        self.records = split_records(records, split)
         self.config, self.seed, self.epoch, self.augment = config, seed, 0, augment
         self.include_ecg = include_ecg
+        from .h5data import H5Reader
+        self.h5_reader = H5Reader(config.max_open_shards)
         if not self.records:
             raise ValueError(f"Empty {split} split")
 
@@ -120,9 +149,15 @@ class PairedDataset(Dataset):
 
     def __getitem__(self, index):
         record = self.records[index]
-        with np.load(record.path, allow_pickle=False) as data:
+        pq, eq = record.ppg_quality, record.ecg_quality
+        if record.h5_row is not None:
+            data, pq, eq = self.h5_reader.read(record, self.include_ecg)
             ppg = read_signal(data, "ppg", self.config.ppg_fs)
             ecg = read_signal(data, "ecg", self.config.ecg_fs) if self.include_ecg else None
+        else:
+            with np.load(record.path, allow_pickle=False) as data:
+                ppg = read_signal(data, "ppg", self.config.ppg_fs)
+                ecg = read_signal(data, "ecg", self.config.ecg_fs) if self.include_ecg else None
         if ppg is None:
             raise ValueError(f"Missing PPG: {record.sample_id}")
         duration = len(ppg) / self.config.ppg_fs
@@ -145,10 +180,14 @@ class PairedDataset(Dataset):
             ecg_crops.append(torch.from_numpy(e)[None])
         return {
             "ppg": ppg_crops, "ecg": ecg_crops, "ecg_valid": ecg is not None,
-            "ppg_quality": record.ppg_quality, "ecg_quality": record.ecg_quality,
+            "ppg_quality": pq, "ecg_quality": eq,
             "subject_id": record.subject_id, "recording_id": record.recording_id,
             "sample_id": record.sample_id,
+            "source": record.source, "subject_known": record.subject_known,
         }
+
+    def close(self):
+        self.h5_reader.close()
 
 
 def make_synthetic(output, subjects=18, windows=6, seconds=10, fs=100, seed=42):

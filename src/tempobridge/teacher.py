@@ -58,9 +58,10 @@ class FrozenTeacher(nn.Module):
         return result.detach()
 
     def verify_data(self, records, ecg_fs):
+        from .data import subject_ids
         if self.input_fs is not None and self.input_fs != ecg_fs:
             raise ValueError("Teacher sampling rate differs from configured ECG sampling rate")
         if self.training_subjects is not None:
-            heldout = {r.subject_id for r in records if r.split != "train"}
+            heldout = subject_ids(records, "val") | subject_ids(records, "test")
             if heldout.intersection(self.training_subjects):
                 raise ValueError("Native teacher saw a held-out patient")

@@ -1,6 +1,6 @@
 # 验证记录
 
-日期：2026-11-05。全部在 **CPU** 上完成；遵照用户要求，没有运行 GPU 训练或 GPU benchmark。
+日期：2026-11-05，数据接入补充验证于 2026-11-06。全部在 **CPU** 上完成；遵照用户要求，没有运行 GPU 训练或 GPU benchmark。
 这里只证明工程流程和指定不变量能够运行，不证明真实数据上的表征质量、临床有效性或论文录用可能性。
 
 ## 环境
@@ -97,3 +97,33 @@ python scripts/check_portability.py --wheel dist/tempobridge-0.1.0-py3-none-any.
 真实 ECG–PPG 数据预训练、独立下游任务提升、跨设备/站点泛化、罕见状态公平性、
 多随机种子、强外部 ECG 教师、CUDA AMP、DDP 或千万级数据吞吐。
 这些属于后续实验范围，不应从 smoke 测试推断出来。
+
+## 2026-11-06 数据接入补充
+
+完成原始 WFDB、本地 VitalDB `.vital`、已有 HDF5 三种接入方式；测试数据全部在本地生成，
+没有运行用户真实临床数据转换或模型预训练。
+
+| 检查 | 实际结果 |
+|---|---|
+| 完整 pytest suite | 63 passed，9.90 秒 |
+| Ruff / git diff --check | 通过 |
+| pip check | No broken requirements found |
+| 原始 WFDB 格式转换 | 95 秒记录保存三个 30 秒窗口；尾部丢弃；磁盘故障后恢复无重复窗口 |
+| 实际 `.vital` 格式转换 | 100 Hz PPG / 200 Hz ECG 共用时间轴；保留 ECG 开始处 1 秒缺口，保存两个 30 秒窗口 |
+| HDF5 完整闭环 | CPU 预热、ECG 教师、分组校准、蒸馏、导出及 PPG 特征提取成功 |
+| HDF5 epoch 恢复 | 含 dropout 的逐参数结果与不中断运行完全一致 |
+| Windows 多进程读取 | 两个 spawn worker 成功读取分片；句柄不被 pickle 传递 |
+| 划分/完整性 | 未知 ID 仅 train 且不进入校准；case 回退、组间隔离、同尺寸文件篡改、相对路径迁移通过 |
+| 来源采样 | 80:20 精确 epoch 配额、无放回、随机种子复现及超容量拒绝通过 |
+
+另外直接载入用户提供的 PulseBound `v6/group_split.py`，独立交叉核验：
+
+- 14 类标识值归一化和 group hash 一致。
+- 0 到 1,000 个组的 90/5/5 整数分配全部一致。
+- 10 种组数的实际组分配一致。
+- 原代码生成的两来源、四分片清单成功导入；包括跨 chunk 重复组、case 回退和未知 ID 行。
+
+本地对照记录位于 `runs/data_compatibility/reference_report.json`；用于生成原清单的临时合成分片已自动释放。
+新数据依赖实际版本：h5py 3.16.0、WFDB 4.3.1、VitalDB 1.7.2。
+测试中的警告来自既有 TorchScript 接口以及 WFDB 对新版 pandas 的废弃接口调用，未造成失败。
+这不证明历史 VitalDB 多模态转换逐样本相同，也不验证真实大数据的吞吐量或临床效果。

@@ -47,7 +47,7 @@ def extract_features(checkpoint, manifest, output, split="test", device="cpu", b
         raise FileExistsError(output)
     state = load_checkpoint(checkpoint)
     config = DataConfig(**state["data_config"])
-    records = read_manifest(manifest, require_train=False)
+    records = read_manifest(manifest, require_train=False, data_config=config)
     dataset = PairedDataset(records, config, split=split, augment=False, include_ecg=False)
     loader = DataLoader(dataset, batch_size=batch_size)
     model = load_encoder(checkpoint, device)
@@ -57,6 +57,7 @@ def extract_features(checkpoint, manifest, output, split="test", device="cpu", b
         values.append(model(batch["ppg"][scale].to(device)).cpu().numpy())
         ids.extend(batch["sample_id"])
         subjects.extend(batch["subject_id"])
+    dataset.close()
     Path(output).parent.mkdir(parents=True, exist_ok=True)
     np.savez(output, embedding=np.concatenate(values), sample_id=np.asarray(ids),
              subject_id=np.asarray(subjects), scale_seconds=config.scales_seconds[scale])
