@@ -1,6 +1,46 @@
 {
-  "model": {"dim": 256, "depth": 6, "protected_depth": 2, "heads": 8, "patch_size": 25, "stem_width": 32, "dropout": 0.0},
-  "data": {"ppg_fs": 100, "ecg_fs": 100, "scales_seconds": [2.0, 8.0], "quality_edges": [0.33, 0.67], "workers": 0},
-  "train": {"epochs": 50, "batch_size": 16, "accumulation": 2, "precision": "bf16", "device": "auto", "transfer_mode": "calibrated", "protect_shallow": true},
-  "calibration": {"folds": 3, "probe": "consensus", "min_subjects_per_bin": 3, "mlp_steps": 200}
+  "model": {
+    "dim": 256,
+    "depth": 6,
+    "protected_depth": 2,
+    "heads": 8,
+    "patch_size": 25,
+    "stem_width": 32,
+    "dropout": 0.1,
+    "encoder": "multiview",
+    "feature_pool": "combined",
+    "feature_layer": -1,
+    "num_tokens": 0,
+    "token_kernel_size": 41,
+    "scalar_dim": 32,
+    "ff_hidden_dim": 512
+  },
+  "data": {
+    "ppg_fs": 100,
+    "ecg_fs": 100,
+    "scales_seconds": [
+      2.0,
+      8.0
+    ],
+    "quality_edges": [
+      0.33,
+      0.67
+    ],
+    "workers": 0
+  },
+  "train": {
+    "epochs": 50,
+    "batch_size": 16,
+    "accumulation": 2,
+    "precision": "bf16",
+    "device": "auto",
+    "transfer_mode": "calibrated",
+    "protect_shallow": true
+  },
+  "calibration": {
+    "folds": 3,
+    "probe": "consensus",
+    "min_subjects_per_bin": 3,
+    "mlp_steps": 200
+  }
 }

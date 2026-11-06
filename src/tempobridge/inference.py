@@ -31,7 +31,7 @@ def load_encoder(path, device="cpu"):
     state = load_checkpoint(path)
     if state.get("kind") != "ppg_encoder":
         raise ValueError("Use the export command to create a PPG-only encoder")
-    model = TempoBridge(ModelConfig(**state["model_config"]))
+    model = TempoBridge(ModelConfig.from_dict(state["model_config"]))
     missing, unexpected = model.load_state_dict(state["model"], strict=False)
     allowed = {"reconstruction.weight", "reconstruction.bias", "morph_reconstruction.weight", "morph_reconstruction.bias"}
     if set(missing) != allowed or unexpected:

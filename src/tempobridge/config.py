@@ -7,6 +7,7 @@ from pathlib import Path
 
 @dataclass
 class ModelConfig:
+    encoder: str = "multiview"
     dim: int = 256
     depth: int = 6
     protected_depth: int = 2
@@ -16,8 +17,19 @@ class ModelConfig:
     ff_multiplier: int = 3
     dropout: float = 0.0
     morphology_branch: bool = True
+    token_kernel_size: int = 41
+    scalar_dim: int = 32
+    scalar_scales: list[float] = field(default_factory=lambda: [10.0 ** i for i in range(-4, 5)])
+    scalar_epsilon: float = 1.1
+    ff_hidden_dim: int = 512
+    xpos_scale_base: float = 512.0
+    num_tokens: int = 0
+    feature_pool: str = "combined"
+    feature_layer: int = -1
 
     def __post_init__(self):
+        if self.encoder not in {"local", "multiview"}:
+            raise ValueError("encoder must be local or multiview")
         if self.dim <= 0 or self.heads <= 0 or self.dim % self.heads:
             raise ValueError("dim must be positive and divisible by heads")
         if (self.dim // self.heads) % 2:
@@ -28,6 +40,27 @@ class ModelConfig:
             raise ValueError("Invalid patch/stem/FF dimensions")
         if not 0 <= self.dropout < 1:
             raise ValueError("dropout must be in [0,1)")
+        if self.token_kernel_size < 1 or self.token_kernel_size % 2 == 0:
+            raise ValueError("token_kernel_size must be a positive odd number")
+        if self.scalar_dim < 1 or self.ff_hidden_dim < 1 or not self.xpos_scale_base > 0:
+            raise ValueError("Invalid multiview encoder dimensions/position scale")
+        if not self.scalar_scales or any(not 0 < s < float("inf") for s in self.scalar_scales):
+            raise ValueError("scalar_scales must be nonempty finite positive values")
+        if not 1 < self.scalar_epsilon < float("inf"):
+            raise ValueError("scalar_epsilon must be finite and greater than one")
+        if self.num_tokens < 0 or self.num_tokens == 1:
+            raise ValueError("num_tokens must be zero (duration-preserving) or >=2")
+        if self.feature_pool not in {"cls", "mean", "combined", "morph_context"}:
+            raise ValueError("Invalid feature_pool")
+        if not -1 <= self.feature_layer < self.depth:
+            raise ValueError("feature_layer must be -1 or a valid zero-based layer")
+
+    @classmethod
+    def from_dict(cls, values):
+        # Historical configs/checkpoints omitted this field and used the local stem.
+        values = dict(values)
+        values.setdefault("encoder", "local")
+        return cls(**values)
 
 
 @dataclass
@@ -104,6 +137,8 @@ class ExperimentConfig:
                     raise ValueError("Each scale * sample rate must be an integer multiple of patch_size")
                 if n < 2 * self.model.patch_size:
                     raise ValueError("Every crop needs at least two patches")
+                if self.model.num_tokens and n != self.model.num_tokens * self.model.patch_size:
+                    raise ValueError("Fixed num_tokens requires scale * fs = num_tokens * patch_size")
         if d.quality_edges != sorted(set(d.quality_edges)) or any(
             not 0 < e < 1 for e in d.quality_edges
         ):
@@ -143,7 +178,7 @@ class ExperimentConfig:
         if unknown:
             raise ValueError(f"Unknown config sections: {unknown}")
         return cls(
-            model=ModelConfig(**values.get("model", {})),
+            model=ModelConfig.from_dict(values["model"]) if "model" in values else ModelConfig(),
             data=DataConfig(**values.get("data", {})),
             train=TrainConfig(**values.get("train", {})),
             calibration=CalibrationConfig(**values.get("calibration", {})),

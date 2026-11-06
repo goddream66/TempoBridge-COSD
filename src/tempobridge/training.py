@@ -5,6 +5,7 @@ import itertools
 import json
 import math
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -12,6 +13,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
 from .calibration import CalibrationWeights
+from .config import ExperimentConfig, ModelConfig
 from .data import PairedDataset, manifest_digest, read_manifest, split_size, subject_ids
 from .model import TempoBridge, TransferHeads, random_mask, reconstruction_loss
 from .sampling import SourceBlockSampler
@@ -127,7 +129,7 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
                   "teacher_kind": teacher_kind if teacher_path else None}
     if student_path:
         initial = load_checkpoint(student_path)
-        if initial["model_config"] != config.to_dict()["model"] or initial["modality"] != "ppg":
+        if asdict(ModelConfig.from_dict(initial["model_config"])) != config.to_dict()["model"] or initial["modality"] != "ppg":
             raise ValueError("Incompatible PPG warm-up checkpoint")
         if initial["manifest_sha256"] != digest:
             raise ValueError("Warm-up data/splits differ")
@@ -170,6 +172,7 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
     first_epoch, global_step, best = 0, 0, float("inf")
     if resume:
         saved = load_checkpoint(resume)
+        saved["config"] = ExperimentConfig.from_dict(saved["config"]).to_dict()
         for key, expected in {"config": config.to_dict(), "manifest_sha256": digest,
                               "stage": stage, "modality": modality, "provenance": provenance}.items():
             if saved[key] != expected:

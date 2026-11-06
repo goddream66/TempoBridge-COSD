@@ -2,15 +2,19 @@
 
 ## 学生与梯度边界
 
-令 x 为 PPG，E0 为 patch stem 与前若干 Transformer 层，Ec 为后层，Gm 为形态支路。
+主路径为 `model.encoder="multiview"`。令 x 为 PPG，T 为 TempoBridgeTokenizer，
+E0 为加入可学习 CLS 后的前若干 Transformer 层，Ec 为后层，Gm 为形态支路。
 
-    h = E0(x)
-    zm = pool(Gm(h))
-    zc = pool(Ec(h))
-    z = concat(zm, zc)
+    h = E0(concat_tokens(T(x), CLS))
+    hm = RMSNorm(h_patches + Gm(h_patches))
+    hc = Ec(h)
+    z = concat_features(hc_CLS, mean(hc_patches))
 
-形态支路采用 h + 小 MLP 的残差形式与 RMSNorm。这里的“形态/上下文”是归纳偏置，
-不是对潜在生理变量的可辨识分解，不保证统计独立或因果解耦。
+CLS 放在 patch 序列末尾，并与 patch 一起进行双向注意力。默认 `combined` 表征拼接 CLS 与
+patch 均值，不包含浅层形态输出。形态支路采用残差小 MLP 与 RMSNorm，用于辅助重建。
+这里的“形态/上下文”是归纳偏置，不是对潜在生理变量的可辨识分解，不保证统计独立或因果解耦。
+可选 `cls`、`mean`、`morph_context` 池化；后者才拼接形态与上下文均值。
+`feature_layer` 可选择某一层的表示快照，但不提前停止后续计算。
 
 PPG 自监督分别从浅层支路和后层预测隐藏 patch，损失为 Huber(context) + α Huber(morphology)。
 α 默认 0.25，不作为创新点。没有 ECG 时，此目标仍覆盖该 PPG 样本。
@@ -18,24 +22,32 @@ PPG 自监督分别从浅层支路和后层预测隐藏 patch，损失为 Huber(
 蒸馏另做一次完整 PPG 前向：
 
     t_s = stopgrad(ECG_teacher(ecg_crop_s))
-    p_s = head_s(pool(Ec(stopgrad(E0(ppg_crop_s)))))
+    h_s = E0(concat_tokens(T(ppg_crop_s), CLS))
+    p_s = head_s(mean_patches(Ec(stopgrad(h_s))))
 
-因此，蒸馏对 E0 的导数严格为零；PPG 自监督对 E0 的导数仍可非零。
+因此，蒸馏对 tokenizer、CLS 和 E0 的导数严格为零；PPG 自监督对它们的导数仍可非零。
 参数共享的 Ec 同时接受两种目标。关闭 protect_shallow 时移除该 stopgrad。
 这是梯度路径约束，不是冻结浅层参数；AdamW 仍会根据 PPG 梯度更新浅层。
 两次学生前向增加训练开销；推理只需要一次。
+蒸馏预测头使用完整上下文层的 patch 均值，`feature_pool` 与 `feature_layer` 定义的公共特征接口
+不会把 ECG token 接入学生。特征设置也会影响校准使用的 PPG 表征，因此修改后应重新校准。
+
+旧 `local` 编码器保留独立 patch 卷积、原有 Transformer 和形态/上下文均值拼接。
+`ModelConfig.from_dict` 对缺少 `encoder` 的历史配置选择 `local`；显式 `multiview` 才选择新路径。
+结构、输入维度与开关见 [编码器说明](ENCODER.md)。
 
 ## 掩码的信息边界
 
 1. 随机选择 patch，不根据教师、未来波形或事件峰位置选边界。
-2. 均值与方差仅由可见 patch 的原始采样点计算。
-3. patch 内卷积独立执行，隐藏 patch 先清零，再替换为 mask token。
-4. patch 的统计特征也只由其可见内容生成。
-5. 完整目标仅在损失端访问并 detach。
+2. 进入 tokenizer 后先清除隐藏采样点。原波形分支仅用可见点估计标准化统计；差分只有相邻两端均可见时才保留，末端补零。
+3. 两条卷积在整段清理后的序列上运行，可以跨 patch 边界读取可见邻域；隐藏 patch 最终替换为 mask token。没有把完整目标波形传给卷积分支。
+4. 均值和标准差支路在模型内部标准化之前，按 patch 计算；隐藏 patch 的统计输入被清零且其融合输出被 mask token 覆盖。
+5. 重建目标独立由完整波形和可见点的均值/方差计算，仅在损失端使用并 detach。编码器不读取目标中隐藏的数值。
 
-修改隐藏波形值不会改变编码器输出，测试对此做精确检查。
-每窗口归一化会移除绝对 DC 偏置和整体增益；保留的是相对波形形态。
-若后续任务需要绝对幅值，应明确其设备标定语义后另行评估幅值通道，不能假定当前表示保留了它。
+该边界要求：固定 mask 和可见输入时，修改隐藏波形只能改变重建目标，不能改变编码器表示。
+两条卷积分支经过逐窗口标准化；统计支路额外携带进入模型时的 patch 均值和波动幅度，
+因此不能再把 `multiview` 表述为“移除了全部 DC/增益信息”。这里也不等于保留设备标定的物理幅值：
+上游数据转换、单位换算或预处理可能已改变幅值。`local` 路径仍对标准化后的 patch 提取特征。
 这是 masked reconstruction 的目标隔离；模型仍在可见上下文内双向注意。
 离线 resample_poly 和原始数据的上游滤波不属于原始流的严格在线因果处理。
 不能把本框架称为 PulseBound 式未来前缀预测方法。

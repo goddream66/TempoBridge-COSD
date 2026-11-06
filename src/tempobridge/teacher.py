@@ -21,7 +21,7 @@ class FrozenTeacher(nn.Module):
             checkpoint = load_checkpoint(path)
             if checkpoint.get("modality") != "ecg" or checkpoint.get("global_step", 0) < 1:
                 raise ValueError("Native teacher requires a trained ECG checkpoint, not random/PPG weights")
-            self.encoder = TempoBridge(ModelConfig(**checkpoint["model_config"]))
+            self.encoder = TempoBridge(ModelConfig.from_dict(checkpoint["model_config"]))
             self.encoder.load_state_dict(checkpoint["model"])
             self.training_subjects = checkpoint["train_subjects"]
             self.input_fs = checkpoint["config"]["data"]["ecg_fs"]

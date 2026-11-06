@@ -1,7 +1,7 @@
-"""Independent RMSNorm/RoPE/SwiGLU encoder; not Mantis checkpoint-compatible.
+"""TempoBridge multiview encoder and the checkpoint-compatible local baseline.
 
-No ECG tensor occurs in this module's public inference interface.
-Patch-local convolution and visible-only normalization prevent masked-target leakage.
+Only PPG is required for inference. Hidden samples are excluded before all
+tokenizer computations; reconstruction targets are normalized separately.
 """
 
 from dataclasses import asdict
@@ -11,9 +11,10 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from .config import ModelConfig
+from .encoding import TempoBridgeAttentionBlock, TempoBridgeTokenizer
 
 
-class RMSNorm(nn.Module):
+class TempoBridgeLocalRMSNorm(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
@@ -23,7 +24,7 @@ class RMSNorm(nn.Module):
         return y.to(x.dtype) * self.weight
 
 
-def rotary(x: Tensor) -> Tensor:
+def tempobridge_local_rotary(x: Tensor) -> Tensor:
     """Rotary position embedding on the time axis [B,H,N,D]."""
     n, d = x.shape[-2:]
     frequency = torch.exp(
@@ -36,11 +37,11 @@ def rotary(x: Tensor) -> Tensor:
     return torch.stack((a * c - b * s, a * s + b * c), -1).flatten(-2).to(x.dtype)
 
 
-class Block(nn.Module):
+class TempoBridgeLocalBlock(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.heads, self.dropout = cfg.heads, cfg.dropout
-        self.norm1, self.norm2 = RMSNorm(cfg.dim), RMSNorm(cfg.dim)
+        self.norm1, self.norm2 = TempoBridgeLocalRMSNorm(cfg.dim), TempoBridgeLocalRMSNorm(cfg.dim)
         self.qkv = nn.Linear(cfg.dim, 3 * cfg.dim, bias=False)
         self.out = nn.Linear(cfg.dim, cfg.dim, bias=False)
         hidden = cfg.dim * cfg.ff_multiplier
@@ -52,7 +53,7 @@ class Block(nn.Module):
         q, k, v = self.qkv(self.norm1(x)).view(b, n, 3, self.heads, d // self.heads).unbind(2)
         q, k, v = (a.transpose(1, 2) for a in (q, k, v))
         y = F.scaled_dot_product_attention(
-            rotary(q), rotary(k), v,
+            tempobridge_local_rotary(q), tempobridge_local_rotary(k), v,
             dropout_p=self.dropout if self.training else 0.0,
         ).transpose(1, 2).reshape(b, n, d)
         x = x + F.dropout(self.out(y), self.dropout, self.training)
@@ -60,7 +61,7 @@ class Block(nn.Module):
         return x + F.dropout(self.down(a * F.silu(gate)), self.dropout, self.training)
 
 
-class PatchStem(nn.Module):
+class TempoBridgeLocalTokenizer(nn.Module):
     """Every patch is convolved independently, including at patch boundaries."""
     def __init__(self, cfg):
         super().__init__()
@@ -85,22 +86,30 @@ class TempoBridge(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
-        self.stem = PatchStem(config)
-        self.shallow = nn.ModuleList([Block(config) for _ in range(config.protected_depth)])
+        enhanced = config.encoder == "multiview"
+        self.stem = TempoBridgeTokenizer(config) if enhanced else TempoBridgeLocalTokenizer(config)
+        block_type = TempoBridgeAttentionBlock if enhanced else TempoBridgeLocalBlock
+        self.summary_token = nn.Parameter(torch.randn(config.dim)) if enhanced else None
+        self.shallow = nn.ModuleList([block_type(config) for _ in range(config.protected_depth)])
         self.context = nn.ModuleList(
-            [Block(config) for _ in range(config.depth - config.protected_depth)]
+            [block_type(config) for _ in range(config.depth - config.protected_depth)]
         )
-        self.context_norm = RMSNorm(config.dim)
+        self.context_norm = nn.Identity() if enhanced else TempoBridgeLocalRMSNorm(config.dim)
         self.morphology = nn.Sequential(
             nn.LayerNorm(config.dim), nn.Linear(config.dim, config.dim), nn.GELU(),
             nn.Linear(config.dim, config.dim),
         ) if config.morphology_branch else nn.Identity()
-        self.morph_norm = RMSNorm(config.dim)
+        self.morph_norm = TempoBridgeLocalRMSNorm(config.dim)
         self.reconstruction = nn.Linear(config.dim, config.patch_size)
         self.morph_reconstruction = nn.Linear(config.dim, config.patch_size)
 
     @property
     def feature_dim(self):
+        if self.config.encoder == "multiview":
+            if self.config.feature_pool == "combined":
+                return 2 * self.config.dim
+            if self.config.feature_pool != "morph_context":
+                return self.config.dim
         return 2 * self.config.dim if self.config.morphology_branch else self.config.dim
 
     def prepare(self, x: Tensor, mask: Tensor | None = None):
@@ -112,6 +121,8 @@ class TempoBridge(nn.Module):
         if not torch.isfinite(x).all():
             raise ValueError("Waveforms must be finite; mark missing ECG separately")
         raw = x.float().reshape(x.shape[0], -1, p)
+        if self.config.num_tokens and raw.shape[1] != self.config.num_tokens:
+            raise ValueError("Input length differs from fixed num_tokens * patch_size")
         if mask is None:
             mask = torch.zeros(raw.shape[:2], device=x.device, dtype=torch.bool)
         if mask.shape != raw.shape[:2] or mask.dtype != torch.bool:
@@ -126,26 +137,49 @@ class TempoBridge(nn.Module):
         ) / count
         scale = variance.sqrt().clamp_min(1e-4)
         target = (raw - mean) / scale
-        return self.stem(target, mask), target, mask
+        stem_input = raw if self.config.encoder == "multiview" else target
+        return self.stem(stem_input, mask), target, mask
 
-    def encode(self, x, mask=None, detach_shallow=False):
+    def encode(self, x, mask=None, detach_shallow=False, return_layer=-1):
+        if not -1 <= return_layer < self.config.depth:
+            raise ValueError("return_layer must be -1 or a valid zero-based layer")
         h, target, mask = self.prepare(x, mask)
-        for block in self.shallow:
+        if self.summary_token is not None:
+            h = torch.cat((h, self.summary_token[None, None].expand(len(h), 1, -1)), dim=1)
+        selected = None
+        for index, block in enumerate(self.shallow):
             h = block(h)
-        morph = self.morph_norm(h + self.morphology(h))
+            if index == return_layer:
+                selected = h
+        patch_h = h[:, :-1] if self.summary_token is not None else h
+        morph = self.morph_norm(patch_h + self.morphology(patch_h))
         context = h.detach() if detach_shallow else h
-        for block in self.context:
+        for index, block in enumerate(self.context, start=len(self.shallow)):
             context = block(context)
-        context = self.context_norm(context)
-        return {"morphology": morph, "context": context, "target": target, "mask": mask}
+            if index == return_layer:
+                selected = context
+        if selected is not None and detach_shallow and return_layer < len(self.shallow):
+            # A requested shallow snapshot must obey the same gradient boundary
+            # as the normal hand-off to the context blocks.
+            selected = selected.detach()
+        context = self.context_norm(context if selected is None else selected)
+        summary = context[:, -1] if self.summary_token is not None else context.mean(1)
+        patches = context[:, :-1] if self.summary_token is not None else context
+        return {"morphology": morph, "context": patches, "summary": summary,
+                "target": target, "mask": mask}
 
     def forward_features(self, x):
-        result = self.encode(x)
+        result = self.encode(x, return_layer=self.config.feature_layer)
         c = result["context"].mean(1)
         m = result["morphology"].mean(1)
-        z = torch.cat((m, c), -1) if self.config.morphology_branch else c
+        if self.config.encoder == "multiview" and self.config.feature_pool != "morph_context":
+            pool = self.config.feature_pool
+            z = (torch.cat((result["summary"], c), -1) if pool == "combined" else
+                 result["summary"] if pool == "cls" else c)
+        else:
+            z = torch.cat((m, c), -1) if self.config.morphology_branch else c
         return {"embedding": z, "context": c, "morphology": m,
-                "tokens": result["context"]}
+                "summary": result["summary"], "tokens": result["context"]}
 
     def forward(self, ppg):
         return self.forward_features(ppg)["embedding"]

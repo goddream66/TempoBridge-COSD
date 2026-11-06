@@ -11,12 +11,11 @@ TempoBridge 实现一条可以执行和审计的研究路线：先学习 PPG 本
 
 ```mermaid
 flowchart LR
-    X[PPG] --> P[patch 内卷积 / 连续向量]
+    X[PPG] --> P[原波形与差分卷积 / 多尺度统计 token]
     P --> S[浅层 Transformer]
-    S --> M[形态支路]
+    S --> M[辅助形态支路]
     S --> C[上下文 Transformer]
-    M --> Z[拼接 PPG 表征]
-    C --> Z
+    C --> Z[CLS 与 patch 均值拼接 / PPG 表征]
     M --> R[遮挡重建]
     C --> R
     C --> H[各时间尺度预测头]
@@ -27,18 +26,22 @@ flowchart LR
     H --> L
 ```
 
-- 基础配置：6 层 Transformer、维度 256、8 头，前 2 层受保护；RMSNorm、RoPE、SwiGLU。
-- 输入是固定时长 patch 的**连续向量**，没有离散码本或词表。
-- 形态支路读取浅层 token；上下文支路读取完整序列。最终表征为两路均值池化的拼接。
+- 主编码器为 `model.encoder="multiview"`：6 层 Transformer、维度 256、8 头，前 2 层受保护；RMSNorm、带 XPos 缩放的旋转位置编码、SwiGLU。
+- `TempoBridgeTokenizer` 将原波形、相邻差分、patch 均值和标准差融合为**连续向量**，没有离散码本或词表。两条卷积分支在整段波形上运行，默认卷积核为 41；统计量在模型内部标准化之前提取。
+- 默认保持固定 `patch_size` 对应的物理时长，`num_tokens=0` 允许 token 数随窗口长度变化。不同蒸馏尺度分别编码，不通过强制缩放成 32 个 token 改变时间含义。
+- 默认 `feature_pool="combined"` 拼接完整编码器的 CLS 表征与 patch token 均值，得到 512 维输出。浅层形态支路用于辅助重建，不参与该默认拼接；可选 `cls`、`mean` 或 `morph_context` 输出。
+- `feature_layer=-1` 使用最终层；也可选择从 0 开始编号的层快照。当前仍计算完整编码器，选择浅层输出不等于减少计算。
 - PPG 自监督更新整个学生；ECG 蒸馏默认只更新上下文层和预测头。
 - 两个尺度分别实际裁剪、分别编码，短尺度教师看不到裁剪外的长上下文。
 - 校准预测器按患者划分，目标归一化在每个拟合折内完成；评分按患者平衡。
 - 无 ECG 或零权重样本仍参加 PPG 自监督。权重固定，不通过蒸馏损失学习。
 - 对外 `forward(ppg)` 只接受 PPG。导出文件不含教师、校准器、蒸馏头或重建头权重。
 
-代码为独立实现，参考 MantisV2 的通用 Transformer 组件选择和 PulseBound 的严谨信息边界分析。
-**不是 Mantis 的逐行移植，不兼容其 checkpoint；没有复制 PulseBound 源码。**
-详见 [方法与数学边界](docs/METHOD.md)、[相关工作与贡献边界](docs/RESEARCH.md)。
+算法模块以 TempoBridge 命名并独立实现，保留本项目的选择性蒸馏、跨患者校准和浅层梯度保护。
+这是选定组件的组合与适配，不是整篇论文的复现，也不表示已有性能优势。
+旧配置或 checkpoint 未包含 `encoder` 字段时，`ModelConfig.from_dict` 仍选择原有 `local` 编码器。
+两种编码器权重不能直接互换；切换架构后应重新预热、训练教师并校准。
+详见 [编码器结构与配置](docs/ENCODER.md)、[方法与数学边界](docs/METHOD.md)、[研究与实验设计](docs/RESEARCH.md)。
 
 ## 安装
 
@@ -57,7 +60,7 @@ python -m venv .venv
 Linux/macOS 使用 `python3 -m venv .venv`、`source .venv/bin/activate` 后运行相同的 pip/CLI 命令。
 请使用独立环境，不要启用 `--system-site-packages`，以避免继承系统 Anaconda 的数值运行库冲突。
 下面的 `python` 均指已安装本项目的环境；Windows 也可以直接使用 `.\.venv\Scripts\python.exe`。
-本次已完成验证的本地环境是 `.venv-cpu`，可直接使用 `.\.venv-cpu\Scripts\python.exe`。
+如本地已创建 `.venv-cpu`，也可使用 `.\.venv-cpu\Scripts\python.exe`。
 迁移项目时重新创建虚拟环境，不复制 `.venv` 或 `.venv-cpu`。
 
 ## 一次运行完整闭环
@@ -108,6 +111,7 @@ with torch.inference_mode():
 ```
 
 推理输入必须使用导出配置中的 PPG 采样率，长度为 patch_size 的整数倍，至少包含两个 patch。
+若显式设置 `num_tokens=32`，输入还必须满足 `length=32*patch_size`；模型不会自动重采样或重划 patch。
 `features` 命令完全忽略 NPZ 中可能存在的 ECG。模型是窗口级双向编码器，不声称在线因果预测。
 
 ## 校准与消融
@@ -123,7 +127,8 @@ with torch.inference_mode():
 | `none` | 不计算蒸馏，继续 PPG 自监督 |
 
 对照仍复用同一校准文件中的目标标准化，避免改变目标数值尺度。
-`protect_shallow=false` 关闭梯度保护；`model.morphology_branch=false` 关闭形态支路。
+`protect_shallow=false` 关闭梯度保护；`model.morphology_branch=false` 关闭辅助形态重建。
+默认 `combined` 输出仍为 CLS 与 patch 均值拼接，不因关闭形态支路改变维度。
 架构、时间尺度、训练数据或教师变更后，重新预热/校准；已有 artifact 不允许悄悄复用。
 `random` 不保证在不同 ECG 质量分布下总有效权重完全相同，严格预算对照需额外匹配。
 

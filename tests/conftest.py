@@ -10,11 +10,12 @@ def deterministic_cpu():
     torch.manual_seed(123)
 
 
-@pytest.fixture
-def tiny_config():
+@pytest.fixture(params=["local", "multiview"])
+def tiny_config(request):
     return ExperimentConfig.from_dict({
-        "model": {"dim": 16, "depth": 3, "protected_depth": 1, "heads": 2,
-                  "patch_size": 10, "stem_width": 4, "ff_multiplier": 2},
+        "model": {"encoder": request.param, "dim": 16, "depth": 3, "protected_depth": 1, "heads": 2,
+                  "patch_size": 10, "stem_width": 4, "ff_multiplier": 2,
+                  "token_kernel_size": 9, "scalar_dim": 8, "ff_hidden_dim": 32},
         "data": {"ppg_fs": 100, "ecg_fs": 100, "scales_seconds": [0.5, 1.0],
                  "quality_edges": [0.33, 0.67]},
         "train": {"epochs": 2, "batch_size": 6, "accumulation": 2, "device": "cpu",

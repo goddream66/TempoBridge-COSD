@@ -5,6 +5,7 @@ This estimates learnability under these probes, not intrinsic observability or u
 """
 
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -130,10 +131,10 @@ def calibrate(config, manifest, student_path, teacher_path, output, teacher_kind
         raise ValueError("Calibration requires a trained PPG warm-up checkpoint")
     if checkpoint["manifest_sha256"] != digest:
         raise ValueError("Student warm-up and calibration manifest differ")
-    if checkpoint["model_config"] != config.to_dict()["model"]:
+    if asdict(ModelConfig.from_dict(checkpoint["model_config"])) != config.to_dict()["model"]:
         raise ValueError("Student architecture differs from config")
     device = device_for(config.train.device)
-    model = TempoBridge(ModelConfig(**checkpoint["model_config"])).to(device)
+    model = TempoBridge(ModelConfig.from_dict(checkpoint["model_config"])).to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval().requires_grad_(False)
     teacher = FrozenTeacher(teacher_path, teacher_kind).to(device)
