@@ -135,6 +135,10 @@ class PairedDataset(Dataset):
                  include_ecg=True):
         self.records = split_records(records, split)
         self.config, self.seed, self.epoch, self.augment = config, seed, 0, augment
+        if config.window_mode not in {"full", "crop"}:
+            raise ValueError("window_mode must be full or crop")
+        if config.window_mode == "full" and len(config.scales_seconds) != 1:
+            raise ValueError("full window_mode requires exactly one duration")
         self.include_ecg = include_ecg
         from .h5data import H5Reader
         self.h5_reader = H5Reader(config.max_open_shards)
@@ -160,6 +164,15 @@ class PairedDataset(Dataset):
                 ecg = read_signal(data, "ecg", self.config.ecg_fs) if self.include_ecg else None
         if ppg is None:
             raise ValueError(f"Missing PPG: {record.sample_id}")
+        if self.config.window_mode == "full":
+            seconds = self.config.scales_seconds[0]
+            if len(ppg) != round(seconds * self.config.ppg_fs) or (
+                ecg is not None and len(ecg) != round(seconds * self.config.ecg_fs)
+            ):
+                raise ValueError(
+                    f"full window_mode requires exactly {seconds:g} seconds per waveform: "
+                    f"{record.sample_id}; use crop mode explicitly for longer recordings"
+                )
         duration = len(ppg) / self.config.ppg_fs
         if ecg is not None:
             ecg_duration = len(ecg) / self.config.ecg_fs
@@ -172,7 +185,8 @@ class PairedDataset(Dataset):
         ppg_crops, ecg_crops = [], []
         for seconds in self.config.scales_seconds:
             available = max(0, duration - seconds)
-            start = rng.uniform(0, available) if self.augment else available / 2
+            start = (0.0 if self.config.window_mode == "full" else
+                     rng.uniform(0, available) if self.augment else available / 2)
             p_start, e_start = round(start * self.config.ppg_fs), round(start * self.config.ecg_fs)
             p_len, e_len = round(seconds * self.config.ppg_fs), round(seconds * self.config.ecg_fs)
             ppg_crops.append(torch.from_numpy(ppg[p_start:p_start + p_len].copy())[None])

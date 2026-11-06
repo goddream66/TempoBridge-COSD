@@ -93,7 +93,7 @@ def test_mixed_ecg_and_quality_reading_without_reprocessing(tmp_path):
     spec.write_text(json.dumps({'sources': {'mimic': {'root': 'shards'}}}))
     build_h5_manifest(spec, tmp_path / 'index.json')
     records = read_manifest(tmp_path / 'index.json')
-    cfg = DataConfig(ppg_fs=50, ecg_fs=50, scales_seconds=[1.0])
+    cfg = DataConfig(ppg_fs=50, ecg_fs=50, scales_seconds=[1.0], window_mode='crop')
     ds = PairedDataset(records, cfg, augment=False)
     assert [ds[i]['ecg_valid'] for i in range(5)] == [True, False, False, False, True]
     np.testing.assert_array_equal(ds[0]['ppg'][0].numpy().ravel(), expected)
@@ -184,7 +184,8 @@ def test_exact_source_mix_no_replacement_and_epoch_seed(tmp_path):
 
 def test_h5_spawn_workers_and_lru(tmp_path):
     manifest = make_index(tmp_path)
-    cfg = DataConfig(ppg_fs=50, ecg_fs=50, scales_seconds=[1.0], max_open_shards=1)
+    cfg = DataConfig(ppg_fs=50, ecg_fs=50, scales_seconds=[1.0], max_open_shards=1,
+                     window_mode='crop')
     dataset = PairedDataset(read_manifest(manifest), cfg, split='val', augment=False)
     # Parent opens a handle before spawn; workers must never inherit/pickle it.
     dataset[0]

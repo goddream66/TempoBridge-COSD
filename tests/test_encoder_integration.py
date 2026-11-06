@@ -17,7 +17,7 @@ def small_model_config(**overrides):
 
 
 def test_new_default_and_historical_config_have_distinct_architectures():
-    assert ModelConfig().encoder == 'multiview'
+    assert ModelConfig().encoder == 'selective'
     assert ModelConfig.from_dict({'dim': 16, 'heads': 2}).encoder == 'local'
     assert ModelConfig.from_dict({'encoder': 'multiview'}).encoder == 'multiview'
 

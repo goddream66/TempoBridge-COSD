@@ -13,8 +13,9 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Subset
 
+from .config import DataConfig, ModelConfig
 from .data import PairedDataset, manifest_digest, read_manifest, subject_ids
-from .model import ModelConfig, TempoBridge
+from .model import TempoBridge
 from .sampling import calibration_indices
 from .teacher import FrozenTeacher
 from .utils import device_for, file_sha256, load_checkpoint, seed_all, write_json
@@ -133,6 +134,8 @@ def calibrate(config, manifest, student_path, teacher_path, output, teacher_kind
         raise ValueError("Student warm-up and calibration manifest differ")
     if asdict(ModelConfig.from_dict(checkpoint["model_config"])) != config.to_dict()["model"]:
         raise ValueError("Student architecture differs from config")
+    if DataConfig.from_dict(checkpoint["config"]["data"]).input_protocol() != config.data.input_protocol():
+        raise ValueError("Student warm-up input protocol differs from config; warm up again")
     device = device_for(config.train.device)
     model = TempoBridge(ModelConfig.from_dict(checkpoint["model_config"])).to(device)
     model.load_state_dict(checkpoint["model"])
@@ -172,6 +175,7 @@ def calibrate(config, manifest, student_path, teacher_path, output, teacher_kind
                       "reliable_pairs": len(subjects), "unknown_ids_excluded": True,
                       "max_windows_per_subject": config.calibration.max_windows_per_subject},
         "scales_seconds": config.data.scales_seconds, "ppg_fs": config.data.ppg_fs,
+        "window_mode": config.data.window_mode,
         "ecg_fs": config.data.ecg_fs, "quality_edges": config.data.quality_edges,
         "calibration_config": config.to_dict()["calibration"],
         "target_dim": len(reports[0]["target_mean"]), "scales": reports,
@@ -201,10 +205,12 @@ class CalibrationWeights(nn.Module):
         expected = {"manifest_sha256": manifest_hash, "teacher_sha256": teacher_hash,
                     "student_sha256": student_hash, "teacher_kind": teacher_kind,
                     "scales_seconds": config.data.scales_seconds,
+                    "window_mode": config.data.window_mode,
                     "quality_edges": config.data.quality_edges,
                     "ppg_fs": config.data.ppg_fs, "ecg_fs": config.data.ecg_fs}
         for key, value in expected.items():
-            if a.get(key) != value:
+            saved_value = a.get(key, "crop") if key == "window_mode" else a.get(key)
+            if saved_value != value:
                 raise ValueError(f"Stale/incompatible calibration: {key}")
         if self.weights.shape != (len(config.data.scales_seconds), len(config.data.quality_edges) + 1):
             raise ValueError("Invalid calibration weight shape")

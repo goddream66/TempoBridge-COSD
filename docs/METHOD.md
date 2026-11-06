@@ -2,7 +2,7 @@
 
 ## 学生与梯度边界
 
-主路径为 `model.encoder="multiview"`。令 x 为 PPG，T 为 TempoBridgeTokenizer，
+主实验路径为 `model.encoder="selective"`。令 x 为 PPG，T 为包含多感受野选择的 tokenizer，
 E0 为加入可学习 CLS 后的前若干 Transformer 层，Ec 为后层，Gm 为形态支路。
 
     h = E0(concat_tokens(T(x), CLS))
@@ -26,38 +26,77 @@ PPG 自监督分别从浅层支路和后层预测隐藏 patch，损失为 Huber(
     p_s = head_s(mean_patches(Ec(stopgrad(h_s))))
 
 因此，蒸馏对 tokenizer、CLS 和 E0 的导数严格为零；PPG 自监督对它们的导数仍可非零。
+新增的多感受野选择器位于 tokenizer 内，也遵守这一边界。它根据 PPG 特征进行自适应融合，
+不是由 ECG 蒸馏直接训练的选择器；当前没有添加绕过保护边界的适配器或额外选择器损失。
 参数共享的 Ec 同时接受两种目标。关闭 protect_shallow 时移除该 stopgrad。
 这是梯度路径约束，不是冻结浅层参数；AdamW 仍会根据 PPG 梯度更新浅层。
 两次学生前向增加训练开销；推理只需要一次。
 蒸馏预测头使用完整上下文层的 patch 均值，`feature_pool` 与 `feature_layer` 定义的公共特征接口
 不会把 ECG token 接入学生。特征设置也会影响校准使用的 PPG 表征，因此修改后应重新校准。
 
-旧 `local` 编码器保留独立 patch 卷积、原有 Transformer 和形态/上下文均值拼接。
-`ModelConfig.from_dict` 对缺少 `encoder` 的历史配置选择 `local`；显式 `multiview` 才选择新路径。
+`multiview` 保留原单核四路编码，`local` 保留独立 patch 卷积、原有 Transformer 和形态/上下文均值拼接。
+`ModelConfig.from_dict` 对缺少 `encoder` 的历史配置选择 `local`；新增实验显式指定编码器。
 结构、输入维度与开关见 [编码器说明](ENCODER.md)。
+
+## 多感受野选择
+
+参考 [Selective Kernel Networks](https://arxiv.org/abs/1903.06586) 的 Split–Fuse–Select 思路，
+在原波形和差分两条支路内分别进行一维多感受野编码。原论文的空间分支与全局通道选择，
+在本项目中适配为低维 depthwise/pointwise 时间分支、可见点全局描述、patch 局部描述和覆盖率处理。
+`selective_kernel_sizes` 是采样点数而非秒数；默认 `[9,21,41]` 在 50 Hz 与 100 Hz 的物理感受野不同。
+
+对于第 i 个 patch、第 k 个分支、第 c 个通道，记分支表示为 U(i,k,c)：
+
+    local_i = sum_k U(i,k,:)
+    global = sum_i visible_count_i * local_i / sum_i visible_count_i
+    descriptor_i = global + local_i
+    logits_i = selection_mlp(descriptor_i) + log(coverage_i)
+    alpha(i,k,c) = softmax_over_branches(logits_i)[k,c]
+    V(i,c) = sum_k alpha(i,k,c) * U(i,k,c)
+
+该式对应局部描述和覆盖率均启用的模式；零覆盖分支在 softmax 前排除，空 patch 最终权重为零。
+卷积分支同时进行有上限的支持率补偿：记录内可用支持数除以可见支持数，最多放大 4 倍。
+softmax 沿分支轴计算，
+每个 patch 的每个通道有各自的分支权重，不是为整个窗口只选一个卷积核。
+`selective_fusion="mean"` 在有效分支间固定平均，检验收益是否来自可学习选择本身。
+`selective_local_context=false` 仅使用全局描述；`selective_coverage=false` 关闭幅值补偿与 logits 的对数覆盖率项，
+但它们都不会取消隐藏样本在输入特征构造前的清除。
+
+覆盖率描述已观察到多少输入，不等于生理 SQI 或校准后的可信概率；本轮没有加入频域分支、
+VQ 码本、显式心搏检测或额外生理目标。该适配是否改善泛化由单独消融判断，不作首次或性能保证。
 
 ## 掩码的信息边界
 
 1. 随机选择 patch，不根据教师、未来波形或事件峰位置选边界。
 2. 进入 tokenizer 后先清除隐藏采样点。原波形分支仅用可见点估计标准化统计；差分只有相邻两端均可见时才保留，末端补零。
-3. 两条卷积在整段清理后的序列上运行，可以跨 patch 边界读取可见邻域；隐藏 patch 最终替换为 mask token。没有把完整目标波形传给卷积分支。
+3. 原波形和差分的卷积分支在整段清理后的序列上运行，可以跨 patch 边界读取可见邻域；分支融合的全局/局部描述也仅来自可见输入。隐藏 patch 最终替换为 mask token，没有把完整目标波形传给分支或门控。
 4. 均值和标准差支路在模型内部标准化之前，按 patch 计算；隐藏 patch 的统计输入被清零且其融合输出被 mask token 覆盖。
 5. 重建目标独立由完整波形和可见点的均值/方差计算，仅在损失端使用并 detach。编码器不读取目标中隐藏的数值。
 
 该边界要求：固定 mask 和可见输入时，修改隐藏波形只能改变重建目标，不能改变编码器表示。
 两条卷积分支经过逐窗口标准化；统计支路额外携带进入模型时的 patch 均值和波动幅度，
-因此不能再把 `multiview` 表述为“移除了全部 DC/增益信息”。这里也不等于保留设备标定的物理幅值：
+因此不能把 `multiview` 或 `selective` 表述为“移除了全部 DC/增益信息”。这里也不等于保留设备标定的物理幅值：
 上游数据转换、单位换算或预处理可能已改变幅值。`local` 路径仍对标准化后的 patch 提取特征。
 这是 masked reconstruction 的目标隔离；模型仍在可见上下文内双向注意。
 离线 resample_poly 和原始数据的上游滤波不属于原始流的严格在线因果处理。
 不能把本框架称为 PulseBound 式未来前缀预测方法。
 
-## 多尺度目标
+## 完整窗口与可选多尺度目标
 
-默认 2s/8s 只是初始实验设置。每个尺度在输入信号上裁剪后，分别运行教师与学生。
+主实验配置使用 `window_mode="full"`、`scales_seconds=[30.0]`。数据加载器要求整条同步记录
+恰好为 30 秒，将完整 PPG 与 ECG 分别送入学生与教师；不会从长记录偷偷取中间 30 秒，也不会补短记录。
+这是单一观察时长上的校准/蒸馏；多感受野 token 是同一次前向中的局部卷积结构，与多个裁剪时长是不同变量。
+
+2 秒/8 秒保留为 `configs/ablation_2s8s.json` 的 `window_mode="crop"` 消融。
+训练时两个尺度独立采样裁剪起点，同尺度 ECG/PPG 在物理时间上对齐；短窗不保证位于长窗内部。
+验证/校准使用各尺度的居中窗口。每个尺度实际裁剪后，分别运行教师与学生。
 禁止先运行长窗口教师再将其全上下文 token 池化成所谓“短尺度目标”。
 两种信号按秒定位，允许不同采样率；同步偏差必须在数据准备阶段审计。
 本版窗口级蒸馏不保证精确逐心搏匹配，生理时延和边界不完整心搏仍可能影响结果。
+
+PulseBound 正式 v6 的 1500 点/50 Hz 输入同样覆盖 30 秒，但采用 1 秒 patch、连续后缀掩码
+及未来心搏目标。本项目只对齐完整输入窗口及指定采样率，仍使用自己的 patch、随机掩码与蒸馏目标。
+从历史 2 秒/8 秒实验切换到 30 秒后必须重新校准，不能复用绑定旧观察时长的校准权重。
 
 ## 交叉拟合
 

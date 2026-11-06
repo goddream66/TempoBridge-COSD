@@ -13,7 +13,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
 from .calibration import CalibrationWeights
-from .config import ExperimentConfig, ModelConfig
+from .config import DataConfig, ExperimentConfig, ModelConfig
 from .data import PairedDataset, manifest_digest, read_manifest, split_size, subject_ids
 from .model import TempoBridge, TransferHeads, random_mask, reconstruction_loss
 from .sampling import SourceBlockSampler
@@ -133,6 +133,8 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
             raise ValueError("Incompatible PPG warm-up checkpoint")
         if initial["manifest_sha256"] != digest:
             raise ValueError("Warm-up data/splits differ")
+        if DataConfig.from_dict(initial["config"]["data"]).input_protocol() != config.data.input_protocol():
+            raise ValueError("Warm-up input protocol differs; warm up and calibrate again")
         if initial.get("global_step", 0) < 1:
             raise ValueError("Warm-up checkpoint has not been trained")
         model.load_state_dict(initial["model"])

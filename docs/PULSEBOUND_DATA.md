@@ -134,7 +134,22 @@ epoch 容量由较稀缺来源决定，并截断至 `LCM(batch_size × accumulat
 不设置 `source_weights`（`{}`）时每个 epoch 使用全部训练窗口，按原始规模决定来源占比。
 单来源数据请将权重改为 `{}`；需要限制 epoch 样本数时同时显式设置来源权重和 `samples_per_epoch`。
 
-新配置使用 50 Hz、patch=10（0.2 秒），模型仍从已存储的 30 秒窗口同步裁出 2 秒/8 秒用于原有方法。
+主配置 `configs/pulsebound_50hz.json` 使用 50 Hz、`data.window_mode="full"`、
+`scales_seconds=[30.0]`。加载器将完整同步 30 秒窗口交给模型；重采样至配置频率后必须恰好为
+1500 点，过长不随机裁剪，过短不补零。有效 ECG 与 PPG 均须满足同一完整窗口约定。
+`configs/base.json`、`configs/laptop_8gb.json` 也统一使用完整 30 秒、50 Hz、patch=10。
+
+2 秒/8 秒是此前本项目额外引入的训练裁剪，不是 PulseBound 主预训练协议。现仅在
+`configs/ablation_2s8s.json` 中保留 `window_mode="crop"` 和 `scales_seconds=[2.0,8.0]`：
+训练时两个尺度各自随机选起点，验证/校准时各自居中；同一尺度内 ECG 与 PPG 同步裁剪，
+短窗不保证嵌套在长窗中。裁剪消融不能与完整 30 秒结果混称为相同输入协议。
+旧配置或 checkpoint 的数据字典缺少 `window_mode` 时，按历史 `crop` 行为读取；
+新的实验配置必须显式写出窗口模式，不能只改 `scales_seconds` 后沿用旧校准产物。
+
+50 Hz 完整 30 秒与 PulseBound 主预训练窗口时长、采样率一致，但模型 patch 仍为 10 点
+（0.2 秒），得到 150 个 PPG patch token，另加 CLS；PulseBound 使用 50 点 patch（1 秒），
+得到 30 个原始 PPG patch token，并另外构造派生视图和寄存器 token。
+本项目仍进行随机 patch 重建和 ECG 选择性蒸馏；没有复制 PulseBound 的后缀掩码及未来状态任务。
 索引建立后，原训练命令中的 `--manifest data/manifest.csv` 替换为 `--manifest data/pulsebound_manifest.json`，
 配置替换为 `--config configs/pulsebound_50hz.json` 即可。该配置默认 CPU/fp32；本次不启动真实数据训练。
 
@@ -157,6 +172,7 @@ epoch 容量由较稀缺来源决定，并截断至 `LCM(batch_size × accumulat
 2. 原始部分分片代码要求所有行都有 ECG 才写 `ecg_wave`；这里逐行写可用性，避免一行缺失导致整片 ECG 丢失。
 3. 当前目标不使用 PulseBound 的未来事件、呼吸、血压等 scaffold 标签，因此不伪造这些字段；生成文件不是完整 scaffold 预训练包。
 4. 所提供补充材料没有完整的历史多模态 VitalDB 原始转换器；本项目的 `.vital` 同步转换器是新增实现，不能宣称逐样本复刻历史处理。
-5. 零相位滤波、Fourier 重采样和整窗 min-max 都属于离线窗口处理；短 crop 的遮挡边界不等同于原始连续信号的严格因果边界。
+5. 零相位滤波、Fourier 重采样和整窗 min-max 都属于离线窗口处理；模型内掩码的目标隔离不等同于原始连续信号的严格因果边界。
+6. 完整 30 秒输入只对齐窗口层面的约定。本项目的 patch 大小、token 组织、随机掩码、教师学生目标与 PulseBound 不同。
 
 已有 HDF5 直接读取最适合保持已有波形；若要严格比较同一语料，应共同使用冻结的原始分片和经核验的同一划分清单。

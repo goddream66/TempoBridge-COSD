@@ -46,7 +46,7 @@ def extract_features(checkpoint, manifest, output, split="test", device="cpu", b
     if Path(output).exists():
         raise FileExistsError(output)
     state = load_checkpoint(checkpoint)
-    config = DataConfig(**state["data_config"])
+    config = DataConfig.from_dict(state["data_config"])
     records = read_manifest(manifest, require_train=False, data_config=config)
     dataset = PairedDataset(records, config, split=split, augment=False, include_ecg=False)
     loader = DataLoader(dataset, batch_size=batch_size)

@@ -4,29 +4,40 @@
     "depth": 6,
     "protected_depth": 2,
     "heads": 8,
-    "patch_size": 25,
+    "patch_size": 10,
     "stem_width": 32,
     "dropout": 0.1,
-    "encoder": "multiview",
+    "encoder": "selective",
     "feature_pool": "combined",
     "feature_layer": -1,
     "num_tokens": 0,
     "token_kernel_size": 41,
     "scalar_dim": 32,
-    "ff_hidden_dim": 512
+    "ff_hidden_dim": 512,
+    "selective_width": 32,
+    "selective_kernel_sizes": [
+      9,
+      21,
+      41
+    ],
+    "selective_reduction": 4,
+    "selective_min_dim": 8,
+    "selective_fusion": "adaptive",
+    "selective_local_context": true,
+    "selective_coverage": true
   },
   "data": {
-    "ppg_fs": 100,
-    "ecg_fs": 100,
+    "ppg_fs": 50,
+    "ecg_fs": 50,
     "scales_seconds": [
-      2.0,
-      8.0
+      30.0
     ],
     "quality_edges": [
       0.33,
       0.67
     ],
-    "workers": 0
+    "workers": 0,
+    "window_mode": "full"
   },
   "train": {
     "epochs": 50,

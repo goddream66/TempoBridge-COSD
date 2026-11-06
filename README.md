@@ -11,7 +11,7 @@ TempoBridge 实现一条可以执行和审计的研究路线：先学习 PPG 本
 
 ```mermaid
 flowchart LR
-    X[PPG] --> P[原波形与差分卷积 / 多尺度统计 token]
+    X[完整 30 秒 PPG] --> P[原波形与差分 / 多感受野选择 / 统计 token]
     P --> S[浅层 Transformer]
     S --> M[辅助形态支路]
     S --> C[上下文 Transformer]
@@ -26,21 +26,24 @@ flowchart LR
     H --> L
 ```
 
-- 主编码器为 `model.encoder="multiview"`：6 层 Transformer、维度 256、8 头，前 2 层受保护；RMSNorm、带 XPos 缩放的旋转位置编码、SwiGLU。
-- `TempoBridgeTokenizer` 将原波形、相邻差分、patch 均值和标准差融合为**连续向量**，没有离散码本或词表。两条卷积分支在整段波形上运行，默认卷积核为 41；统计量在模型内部标准化之前提取。
+- 主实验配置使用 `model.encoder="selective"`：6 层 Transformer、维度 256、8 头，前 2 层受保护；RMSNorm、带 XPos 缩放的旋转位置编码、SwiGLU。
+- 新 tokenizer 保留原波形、相邻差分、patch 均值和标准差四路信息，原波形与差分分别通过低维多感受野分支，再按 patch 和通道选择融合。借鉴 [Selective Kernel Networks](https://arxiv.org/abs/1903.06586) 的 Split–Fuse–Select 算法，增加可见输入上的全局/局部描述及覆盖率处理；不是只拼接三个卷积输出。
+- 默认 `selective_kernel_sizes=[9,21,41]` 的单位是采样点，`selective_width=32`；每条信号支路先融合为 32 维，再与统计支路共同投影回 D 维，不增加 Transformer 的 patch token 数。输出是连续向量，没有离散码本或词表。
+- `data.window_mode="full"`、`scales_seconds=[30.0]` 使用完整同步 30 秒记录；主配置均统一为 50 Hz、patch=10。加载器严格检查长度，过长不自动裁剪、过短不补齐。2 秒/8 秒裁剪仅保留在 `configs/ablation_2s8s.json`。
 - 默认保持固定 `patch_size` 对应的物理时长，`num_tokens=0` 允许 token 数随窗口长度变化。不同蒸馏尺度分别编码，不通过强制缩放成 32 个 token 改变时间含义。
 - 默认 `feature_pool="combined"` 拼接完整编码器的 CLS 表征与 patch token 均值，得到 512 维输出。浅层形态支路用于辅助重建，不参与该默认拼接；可选 `cls`、`mean` 或 `morph_context` 输出。
 - `feature_layer=-1` 使用最终层；也可选择从 0 开始编号的层快照。当前仍计算完整编码器，选择浅层输出不等于减少计算。
 - PPG 自监督更新整个学生；ECG 蒸馏默认只更新上下文层和预测头。
-- 两个尺度分别实际裁剪、分别编码，短尺度教师看不到裁剪外的长上下文。
+- 可选裁剪消融中，每个尺度分别裁剪并编码，同尺度 ECG/PPG 使用同一时间起点；两个尺度独立采样起点，短窗不保证嵌套在长窗中。
 - 校准预测器按患者划分，目标归一化在每个拟合折内完成；评分按患者平衡。
 - 无 ECG 或零权重样本仍参加 PPG 自监督。权重固定，不通过蒸馏损失学习。
 - 对外 `forward(ppg)` 只接受 PPG。导出文件不含教师、校准器、蒸馏头或重建头权重。
 
 算法模块以 TempoBridge 命名并独立实现，保留本项目的选择性蒸馏、跨患者校准和浅层梯度保护。
+新增的感受野选择器位于浅层保护边界之前，默认由 PPG 自监督更新；ECG 蒸馏不直接更新它。
 这是选定组件的组合与适配，不是整篇论文的复现，也不表示已有性能优势。
 旧配置或 checkpoint 未包含 `encoder` 字段时，`ModelConfig.from_dict` 仍选择原有 `local` 编码器。
-两种编码器权重不能直接互换；切换架构后应重新预热、训练教师并校准。
+`multiview` 单核编码器和 `local` 历史编码器仍可用；不同编码器权重不能直接互换，切换架构后重新预热、训练教师并校准。
 详见 [编码器结构与配置](docs/ENCODER.md)、[方法与数学边界](docs/METHOD.md)、[研究与实验设计](docs/RESEARCH.md)。
 
 ## 安装
@@ -72,7 +75,7 @@ python -m pytest -q
 
 smoke 自动执行：合成数据 → 数据审计 → PPG 预热 → ECG 预训练 → 校准 → 蒸馏 → 导出 → 提取测试表示。
 合成信号仅验证工程和优化流程，**不能作为生理有效性或临床任务提升的证据**。
-`configs/smoke.json` 用小模型和 CPU；`configs/base.json` 用正式架构和 CUDA bf16。
+`configs/smoke.json` 用小模型和 CPU；`configs/base.json` 用正式架构、自动选择设备及 bf16。
 另提供 `configs/laptop_8gb.json` 供将来选择：同一正式架构，batch=4、累积8次，等效 batch=32；本次不在用户显卡上训练。
 梯度累积不等价于含 batch statistics 的所有算法；本模型使用逐样本归一化，且不依赖 batch 对比负样本。
 只有 PPG 重建性能被用作训练期验证指标，没有绑定任何下游任务。
@@ -82,6 +85,9 @@ smoke 自动执行：合成数据 → 数据审计 → PPG 预热 → ECG 预训
 已有 PulseBound HDF5、原始 MIMIC WFDB 或本地 VitalDB `.vital`，先按
 [PulseBound 数据接入指南](docs/PULSEBOUND_DATA.md) 转换/建立索引，使用 `configs/pulsebound_50hz.json`。
 也可继续按 [数据约定](docs/DATA.md) 准备 CSV manifest 和 NPZ 波形，并预先按患者划分训练/验证/测试。
+主实验要求每条记录恰好 30 秒。50 Hz 配置输入 1500 点，与 PulseBound 主预训练的存储窗口时长和采样率相同；
+本项目仍用 10 点 patch（150 个 patch token），PulseBound 用 50 点 patch（30 个 PPG patch token）。
+本项目继续使用随机掩码重建和 ECG 选择性蒸馏，不采用其连续后缀掩码和未来心搏状态预测任务。
 
 ```powershell
 python -m tempobridge audit-data --config configs/base.json --manifest data/manifest.csv
@@ -104,17 +110,34 @@ import torch
 from tempobridge.inference import load_encoder
 
 encoder = load_encoder("runs/encoder.pt", device="cuda")
-ppg = torch.randn(4, 1, 800, device="cuda")  # 8 seconds at configured 100 Hz
+ppg = torch.randn(4, 1, 1500, device="cuda")  # 30 seconds at configured 50 Hz
 with torch.inference_mode():
     embedding = encoder(ppg)                # [4, 512] for the base configuration
     temporal = encoder.forward_features(ppg)["tokens"]
 ```
 
 推理输入必须使用导出配置中的 PPG 采样率，长度为 patch_size 的整数倍，至少包含两个 patch。
+上例匹配主实验的 30 秒输入；直接调用编码器虽可接受其他合法长度，但不等于已验证跨时长泛化。
+`features` CLI 通过数据加载器执行导出配置的 `full`/`crop` 窗口约定。
 若显式设置 `num_tokens=32`，输入还必须满足 `length=32*patch_size`；模型不会自动重采样或重划 patch。
 `features` 命令完全忽略 NPZ 中可能存在的 ECG。模型是窗口级双向编码器，不声称在线因果预测。
 
 ## 校准与消融
+
+输入协议与结构对照配置：
+
+| 配置 | 输入与编码器 |
+|---|---|
+| `configs/pulsebound_50hz.json` | 50 Hz 完整 30 秒，`selective` 自适应融合 |
+| `configs/baseline_multiview_30s.json` | 同为完整 30 秒，原 `multiview` 单核编码器 |
+| `configs/ablation_selective_mean_30s.json` | 同为完整 30 秒，多感受野但采用固定平均融合 |
+| `configs/ablation_selective_global_30s.json` | 同为完整 30 秒，选择器仅使用全局描述，关闭局部上下文 |
+| `configs/ablation_selective_no_coverage_30s.json` | 同为完整 30 秒，关闭覆盖率补偿与选择先验，仍阻断隐藏输入 |
+| `configs/ablation_2s8s.json` | `window_mode="crop"`，2 秒/8 秒裁剪，单独检验观察时长变化 |
+
+结构和输入时长应分别消融。30 秒输入对齐不等于网络、清洗和训练目标与 PulseBound 全部相同。
+固定平均消融保留选择器参数但不执行选择器；参数存储相同不代表计算量或有效训练参数相同。
+本项目的 VitalDB 转换和缺失处理仍有已记录的差异，不能宣称逐样本复制其历史语料。
 
 `train.transfer_mode` 支持：
 

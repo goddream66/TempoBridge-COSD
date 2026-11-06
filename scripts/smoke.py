@@ -8,6 +8,8 @@ from pathlib import Path
 
 import numpy as np
 
+from tempobridge.config import ExperimentConfig
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -26,7 +28,11 @@ def main():
 
     manifest = out / "data" / "manifest.csv"
     common = ["--config", args.config, "--manifest", manifest]
-    run("synthetic", "--output", out / "data", "--seconds", 10)
+    config = ExperimentConfig.load(args.config)
+    seconds = max(config.data.scales_seconds)
+    # Match the configured full-window contract, including 30-second validation.
+    run("synthetic", "--output", out / "data", "--seconds", seconds,
+        "--fs", config.data.ppg_fs)
     run("audit-data", *common)
     for modality in ("ppg", "ecg"):
         run("pretrain", *common, "--modality", modality, "--output", out / modality)

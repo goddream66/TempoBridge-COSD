@@ -7,12 +7,12 @@ from pathlib import Path
 
 @dataclass
 class ModelConfig:
-    encoder: str = "multiview"
+    encoder: str = "selective"
     dim: int = 256
     depth: int = 6
     protected_depth: int = 2
     heads: int = 8
-    patch_size: int = 25
+    patch_size: int = 10
     stem_width: int = 32
     ff_multiplier: int = 3
     dropout: float = 0.0
@@ -26,10 +26,17 @@ class ModelConfig:
     num_tokens: int = 0
     feature_pool: str = "combined"
     feature_layer: int = -1
+    selective_width: int = 32
+    selective_kernel_sizes: list[int] = field(default_factory=lambda: [9, 21, 41])
+    selective_reduction: int = 4
+    selective_min_dim: int = 8
+    selective_fusion: str = "adaptive"
+    selective_local_context: bool = True
+    selective_coverage: bool = True
 
     def __post_init__(self):
-        if self.encoder not in {"local", "multiview"}:
-            raise ValueError("encoder must be local or multiview")
+        if self.encoder not in {"local", "multiview", "selective"}:
+            raise ValueError("encoder must be local, multiview or selective")
         if self.dim <= 0 or self.heads <= 0 or self.dim % self.heads:
             raise ValueError("dim must be positive and divisible by heads")
         if (self.dim // self.heads) % 2:
@@ -54,20 +61,35 @@ class ModelConfig:
             raise ValueError("Invalid feature_pool")
         if not -1 <= self.feature_layer < self.depth:
             raise ValueError("feature_layer must be -1 or a valid zero-based layer")
+        if any(type(v) is not int or v < 1 for v in (
+            self.selective_width, self.selective_reduction, self.selective_min_dim,
+        )):
+            raise ValueError("Selective widths/reduction must be positive integers")
+        kernels = self.selective_kernel_sizes
+        if (not kernels or any(type(k) is not int or k < 3 or k % 2 == 0 for k in kernels)
+                or kernels != sorted(set(kernels))):
+            raise ValueError("selective_kernel_sizes must be increasing unique odd integers >=3")
+        if self.selective_fusion not in {"adaptive", "mean"}:
+            raise ValueError("selective_fusion must be adaptive or mean")
+        if type(self.selective_local_context) is not bool or type(self.selective_coverage) is not bool:
+            raise ValueError("Selective switches must be boolean")
 
     @classmethod
     def from_dict(cls, values):
         # Historical configs/checkpoints omitted this field and used the local stem.
         values = dict(values)
         values.setdefault("encoder", "local")
+        if values["encoder"] in {"local", "multiview"}:
+            values.setdefault("patch_size", 25)
         return cls(**values)
 
 
 @dataclass
 class DataConfig:
-    ppg_fs: int = 100
-    ecg_fs: int = 100
-    scales_seconds: list[float] = field(default_factory=lambda: [2.0, 8.0])
+    ppg_fs: int = 50
+    ecg_fs: int = 50
+    scales_seconds: list[float] = field(default_factory=lambda: [30.0])
+    window_mode: str = "full"
     quality_edges: list[float] = field(default_factory=lambda: [0.33, 0.67])
     workers: int = 0
     source_roots: dict[str, str] = field(default_factory=dict)
@@ -76,6 +98,21 @@ class DataConfig:
     source_weights: dict[str, float] = field(default_factory=dict)
     samples_per_epoch: int = 0
     shuffle_block_size: int = 256
+
+    @classmethod
+    def from_dict(cls, values):
+        values = dict(values)
+        if "window_mode" not in values:
+            # Historical JSON dictionaries described random/center cropping.
+            values["window_mode"] = "crop"
+            values.setdefault("scales_seconds", [2.0, 8.0])
+            values.setdefault("ppg_fs", 100)
+            values.setdefault("ecg_fs", 100)
+        return cls(**values)
+
+    def input_protocol(self):
+        return {name: getattr(self, name) for name in
+                ("ppg_fs", "ecg_fs", "scales_seconds", "window_mode")}
 
 
 @dataclass
@@ -130,6 +167,10 @@ class ExperimentConfig:
             raise ValueError("Invalid epoch size or source weights")
         if not d.scales_seconds or len(set(d.scales_seconds)) != len(d.scales_seconds):
             raise ValueError("Scales must be nonempty and unique")
+        if d.window_mode not in {"full", "crop"}:
+            raise ValueError("window_mode must be full or crop")
+        if d.window_mode == "full" and len(d.scales_seconds) != 1:
+            raise ValueError("full window_mode requires exactly one duration")
         for s in d.scales_seconds:
             for fs in (d.ppg_fs, d.ecg_fs):
                 n = round(s * fs)
@@ -177,9 +218,17 @@ class ExperimentConfig:
         unknown = set(values) - {"model", "data", "train", "calibration"}
         if unknown:
             raise ValueError(f"Unknown config sections: {unknown}")
+        model = ModelConfig.from_dict(values["model"]) if "model" in values else ModelConfig()
+        if "data" in values:
+            data = DataConfig.from_dict(values["data"])
+        elif "model" in values and model.encoder in {"local", "multiview"}:
+            # Old abbreviated JSON could omit the entire data section.
+            data = DataConfig.from_dict({})
+        else:
+            data = DataConfig()
         return cls(
-            model=ModelConfig.from_dict(values["model"]) if "model" in values else ModelConfig(),
-            data=DataConfig(**values.get("data", {})),
+            model=model,
+            data=data,
             train=TrainConfig(**values.get("train", {})),
             calibration=CalibrationConfig(**values.get("calibration", {})),
         ).validate()

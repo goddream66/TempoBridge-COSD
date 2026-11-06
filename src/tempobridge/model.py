@@ -11,7 +11,11 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from .config import ModelConfig
-from .encoding import TempoBridgeAttentionBlock, TempoBridgeTokenizer
+from .encoding import (
+    TempoBridgeAttentionBlock,
+    TempoBridgeSelectiveTokenizer,
+    TempoBridgeTokenizer,
+)
 
 
 class TempoBridgeLocalRMSNorm(nn.Module):
@@ -86,8 +90,10 @@ class TempoBridge(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
-        enhanced = config.encoder == "multiview"
-        self.stem = TempoBridgeTokenizer(config) if enhanced else TempoBridgeLocalTokenizer(config)
+        enhanced = config.encoder != "local"
+        tokenizer_types = {"local": TempoBridgeLocalTokenizer, "multiview": TempoBridgeTokenizer,
+                           "selective": TempoBridgeSelectiveTokenizer}
+        self.stem = tokenizer_types[config.encoder](config)
         block_type = TempoBridgeAttentionBlock if enhanced else TempoBridgeLocalBlock
         self.summary_token = nn.Parameter(torch.randn(config.dim)) if enhanced else None
         self.shallow = nn.ModuleList([block_type(config) for _ in range(config.protected_depth)])
@@ -105,7 +111,7 @@ class TempoBridge(nn.Module):
 
     @property
     def feature_dim(self):
-        if self.config.encoder == "multiview":
+        if self.config.encoder != "local":
             if self.config.feature_pool == "combined":
                 return 2 * self.config.dim
             if self.config.feature_pool != "morph_context":
@@ -137,7 +143,7 @@ class TempoBridge(nn.Module):
         ) / count
         scale = variance.sqrt().clamp_min(1e-4)
         target = (raw - mean) / scale
-        stem_input = raw if self.config.encoder == "multiview" else target
+        stem_input = raw if self.config.encoder != "local" else target
         return self.stem(stem_input, mask), target, mask
 
     def encode(self, x, mask=None, detach_shallow=False, return_layer=-1):
@@ -172,7 +178,7 @@ class TempoBridge(nn.Module):
         result = self.encode(x, return_layer=self.config.feature_layer)
         c = result["context"].mean(1)
         m = result["morphology"].mean(1)
-        if self.config.encoder == "multiview" and self.config.feature_pool != "morph_context":
+        if self.config.encoder != "local" and self.config.feature_pool != "morph_context":
             pool = self.config.feature_pool
             z = (torch.cat((result["summary"], c), -1) if pool == "combined" else
                  result["summary"] if pool == "cls" else c)
