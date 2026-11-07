@@ -26,6 +26,9 @@ class FrozenTeacher(nn.Module):
             self.training_subjects = checkpoint["train_subjects"]
             self.input_fs = checkpoint["config"]["data"]["ecg_fs"]
             self.target_dim = self.encoder.config.dim
+            self.feature_spec = {"layer": self.encoder.config.feature_layer,
+                                 "pool": "context_mean", "dim": self.target_dim,
+                                 "input_fs": self.input_fs, "kind": kind}
         elif kind == "torchscript":
             metadata_path = Path(str(path) + ".json")
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -36,6 +39,9 @@ class FrozenTeacher(nn.Module):
             if self.input_fs <= 0 or self.target_dim <= 0:
                 raise ValueError("Invalid external teacher sample rate or feature dimension")
             self.training_subjects = metadata.get("training_subjects")
+            self.feature_spec = {"adapter": metadata.get("feature_spec", "unspecified"),
+                                 "dim": self.target_dim, "input_fs": self.input_fs,
+                                 "kind": kind, "provenance": metadata["provenance"]}
             self.fingerprint = hashlib.sha256(
                 (self.fingerprint + file_sha256(metadata_path)).encode()
             ).hexdigest()

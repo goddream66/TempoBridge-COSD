@@ -159,7 +159,7 @@ def calibrate(config, manifest, student_path, teacher_path, output, teacher_kind
             qualities.extend(batch["ppg_quality"][valid].tolist())
             for s in range(len(features)):
                 x, e = batch["ppg"][s][valid].to(device), batch["ecg"][s][valid].to(device)
-                features[s].append(model(x).cpu().numpy())
+                features[s].append(model.transfer_features(x).cpu().numpy())
                 targets[s].append(teacher(e).cpu().numpy())
     dataset.close()
     if not subjects:
@@ -168,7 +168,8 @@ def calibrate(config, manifest, student_path, teacher_path, output, teacher_kind
                              config.calibration, config.data.quality_edges, config.train.seed)
                for x, y in zip(features, targets)]
     result = {
-        "schema_version": 1, "student_sha256": file_sha256(student_path),
+        "schema_version": 2, "student_sha256": file_sha256(student_path),
+        "feature_spec": model.transfer_feature_spec(), "teacher_feature_spec": teacher.feature_spec,
         "teacher_sha256": teacher.fingerprint, "teacher_kind": teacher_kind,
         "manifest_sha256": digest, "train_subjects": sorted(subject_ids(records, "train")),
         "selection": {"seed": config.train.seed, "candidates": len(indices),
@@ -200,7 +201,7 @@ class CalibrationWeights(nn.Module):
 
     def validate(self, config, manifest_hash, teacher_hash, student_hash, teacher_kind):
         a = self.artifact
-        if a.get("schema_version") != 1:
+        if a.get("schema_version") not in {1, 2}:
             raise ValueError("Unsupported calibration schema")
         expected = {"manifest_sha256": manifest_hash, "teacher_sha256": teacher_hash,
                     "student_sha256": student_hash, "teacher_kind": teacher_kind,
@@ -212,6 +213,12 @@ class CalibrationWeights(nn.Module):
             saved_value = a.get(key, "crop") if key == "window_mode" else a.get(key)
             if saved_value != value:
                 raise ValueError(f"Stale/incompatible calibration: {key}")
+        if a["schema_version"] == 1:
+            raise ValueError("Legacy calibration used a different feature contract; recalibrate")
+        expected_spec = {"version": 1, "layer": config.model.depth - 1,
+                         "pool": "context_mean", "dim": config.model.dim}
+        if a.get("feature_spec") != expected_spec:
+            raise ValueError("Stale/incompatible calibration: feature_spec")
         if self.weights.shape != (len(config.data.scales_seconds), len(config.data.quality_edges) + 1):
             raise ValueError("Invalid calibration weight shape")
         if self.mean.shape != (len(config.data.scales_seconds), a["target_dim"]) or self.scale.shape != self.mean.shape:

@@ -32,6 +32,11 @@ class Record:
     source: str = "default"
     subject_known: bool = True
     stored_fs: float | None = None
+    recording_known: bool = True
+    window_start_s: float = -1.0
+    case_id: str = ""
+    ppg_quality_source: str = "manifest"
+    ecg_quality_source: str = "manifest"
 
 
 def read_manifest(path, check_files=True, require_train=True, data_config=None):
@@ -75,7 +80,14 @@ def read_manifest(path, check_files=True, require_train=True, data_config=None):
             pq, eq = float(row.get("ppg_quality") or 1), float(row.get("ecg_quality") or 1)
             if not (0 <= pq <= 1 and 0 <= eq <= 1):
                 raise ValueError("Quality scores must be finite values in [0,1]")
-            records.append(Record(sid, patient, rec, split, file_path, pq, eq))
+            window_start = float(row.get("window_start_s") or -1)
+            if not np.isfinite(window_start) or (window_start < 0 and window_start != -1):
+                raise ValueError("window_start_s must be nonnegative or -1 (unknown)")
+            records.append(Record(sid, patient, rec, split, file_path, pq, eq,
+                                  source=row.get("source") or "default",
+                                  window_start_s=window_start, case_id=row.get("case_id") or "",
+                                  ppg_quality_source="manifest" if row.get("ppg_quality") else "unknown",
+                                  ecg_quality_source="manifest" if row.get("ecg_quality") else "unknown"))
     if not records or (require_train and not any(r.split == "train" for r in records)):
         raise ValueError("Manifest needs nonempty train split")
     return records
@@ -89,6 +101,10 @@ def manifest_digest(records):
     for r in sorted(records, key=lambda r: r.sample_id):
         digest.update(json.dumps([r.sample_id, r.subject_id, r.recording_id, r.split,
                                   r.ppg_quality, r.ecg_quality]).encode())
+        extra = [r.source, r.window_start_s, r.case_id,
+                 r.ppg_quality_source, r.ecg_quality_source]
+        if extra != ["default", -1.0, "", "manifest", "manifest"]:
+            digest.update(json.dumps(extra).encode())
         with r.path.open("rb") as handle:
             while chunk := handle.read(1024 * 1024):
                 digest.update(chunk)
@@ -154,8 +170,13 @@ class PairedDataset(Dataset):
     def __getitem__(self, index):
         record = self.records[index]
         pq, eq = record.ppg_quality, record.ecg_quality
+        metadata = {"recording_id": record.recording_id, "recording_known": record.recording_known,
+                    "window_start_s": record.window_start_s, "case_id": record.case_id,
+                    "ppg_quality_source": record.ppg_quality_source,
+                    "ecg_quality_source": record.ecg_quality_source}
         if record.h5_row is not None:
             data, pq, eq = self.h5_reader.read(record, self.include_ecg)
+            metadata.update(data.get("metadata", {}))
             ppg = read_signal(data, "ppg", self.config.ppg_fs)
             ecg = read_signal(data, "ecg", self.config.ecg_fs) if self.include_ecg else None
         else:
@@ -182,11 +203,12 @@ class PairedDataset(Dataset):
         if duration + 1e-6 < max(self.config.scales_seconds):
             raise ValueError(f"Recording too short: {record.sample_id}")
         rng = np.random.default_rng(np.random.SeedSequence([self.seed, self.epoch, index]))
-        ppg_crops, ecg_crops = [], []
+        ppg_crops, ecg_crops, crop_offsets = [], [], []
         for seconds in self.config.scales_seconds:
             available = max(0, duration - seconds)
             start = (0.0 if self.config.window_mode == "full" else
                      rng.uniform(0, available) if self.augment else available / 2)
+            crop_offsets.append(start)
             p_start, e_start = round(start * self.config.ppg_fs), round(start * self.config.ecg_fs)
             p_len, e_len = round(seconds * self.config.ppg_fs), round(seconds * self.config.ecg_fs)
             ppg_crops.append(torch.from_numpy(ppg[p_start:p_start + p_len].copy())[None])
@@ -198,6 +220,7 @@ class PairedDataset(Dataset):
             "subject_id": record.subject_id, "recording_id": record.recording_id,
             "sample_id": record.sample_id,
             "source": record.source, "subject_known": record.subject_known,
+            "crop_offsets_s": crop_offsets, **metadata,
         }
 
     def close(self):

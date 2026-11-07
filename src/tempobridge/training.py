@@ -49,8 +49,8 @@ def transfer_loss(model, heads, teacher, calibrator, ppg, ecg, valid,
         return ppg.new_zeros(()), weights.mean()
     with torch.no_grad():
         target = calibrator.normalize(teacher(ecg[selected]), scale_index).detach()
-    tokens = model.encode(ppg[selected], detach_shallow=protect_shallow)["context"]
-    pred = heads(tokens, scale_index).float()
+    features = model.transfer_features(ppg[selected], detach_shallow=protect_shallow)
+    pred = heads(features, scale_index).float()
     error = F.smooth_l1_loss(pred, target.float(), reduction="none").mean(-1)
     # Fixed denominator: small calibrated weights must actually reduce supervision.
     loss = (weights[selected] * error).sum() / len(ppg)

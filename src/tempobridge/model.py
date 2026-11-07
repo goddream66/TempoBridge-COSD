@@ -187,6 +187,14 @@ class TempoBridge(nn.Module):
         return {"embedding": z, "context": c, "morphology": m,
                 "summary": result["summary"], "tokens": result["context"]}
 
+    def transfer_features(self, waveform, detach_shallow=False):
+        """Shared calibration/KD contract, independent of exported feature pooling."""
+        return self.encode(waveform, detach_shallow=detach_shallow)["context"].mean(1)
+
+    def transfer_feature_spec(self):
+        return {"version": 1, "layer": self.config.depth - 1,
+                "pool": "context_mean", "dim": self.config.dim}
+
     def forward(self, ppg):
         return self.forward_features(ppg)["embedding"]
 
@@ -224,4 +232,8 @@ class TransferHeads(nn.Module):
         ])
 
     def forward(self, tokens, scale_index):
-        return self.heads[scale_index](tokens.mean(1))
+        # Retain the historical token API for existing callers/checkpoints.
+        features = tokens.mean(1) if tokens.ndim == 3 else tokens
+        if features.ndim != 2:
+            raise ValueError("Transfer head expects [batch, features] or [batch, tokens, features]")
+        return self.heads[scale_index](features)

@@ -293,8 +293,9 @@ class H5RecordIndex(Sequence):
         row = begin + index - offset
         # Unknown IDs remain one unknown pool, never fictitious independent patients.
         return Record(f"{source}:{self.relative_names[path]}:{row}", f"{source}:{group or 'unknown'}",
-                      f"{source}:{group or 'unknown'}", split, path, 1.0, 1.0,
-                      h5_row=row, source=source, subject_known=group is not None, stored_fs=fs)
+                      "", split, path, 1.0, 1.0,
+                      h5_row=row, source=source, subject_known=group is not None, stored_fs=fs,
+                      recording_known=False, ppg_quality_source="unknown", ecg_quality_source="unknown")
 
     def subset(self, split):
         return H5RecordIndex(None, split=split, _parent=self)
@@ -334,6 +335,22 @@ class H5Reader:
             self.handles.popitem(last=False)[1].close()
         i = record.h5_row
         result = {"ppg": handle["signals"][i], "ppg_fs": record.stored_fs}
+        metadata = {"recording_id": "", "recording_known": False, "window_start_s": -1.0,
+                    "case_id": "", "ppg_quality_source": "unknown", "ecg_quality_source": "unknown"}
+        for field in ("record_key", "record_id"):
+            if field in handle:
+                value = normalize_identifier(handle[field][i])
+                if value is not None:
+                    metadata.update(recording_id=f"{record.source}:{field}:{value}", recording_known=True)
+                    break
+        if "case_id" in handle:
+            value = normalize_identifier(handle["case_id"][i])
+            metadata["case_id"] = f"{record.source}:{value}" if value is not None else ""
+        if "window_start_s" in handle:
+            value = float(handle["window_start_s"][i])
+            if np.isfinite(value) and value >= 0:
+                metadata["window_start_s"] = value
+        result["metadata"] = metadata
         if not np.isfinite(result["ppg"]).all() or np.ptp(result["ppg"]) <= 1e-8:
             raise ValueError(f"Invalid PPG in {record.sample_id}; repair/reconvert the shard before training")
         available = include_ecg and "ecg_wave" in handle and ("has_ecg" not in handle or bool(handle["has_ecg"][i]))
@@ -342,6 +359,8 @@ class H5Reader:
             if np.isfinite(ecg).all() and np.ptp(ecg) > 1e-8:
                 result.update(ecg=ecg, ecg_fs=record.stored_fs)
         pq = float(handle["ppg_quality"][i]) if "ppg_quality" in handle else None
+        if pq is not None:
+            metadata["ppg_quality_source"] = str(handle.attrs.get("ppg_quality_definition", "stored_unspecified"))
         if pq is None and "metrics" in handle:
             names = handle.attrs.get("metric_keys", "")
             if isinstance(names, bytes):
@@ -349,9 +368,13 @@ class H5Reader:
             names = names.split(",") if isinstance(names, str) else list(names)
             if "sqi" in names:
                 pq = float(handle["metrics"][i, names.index("sqi")])
+                metadata["ppg_quality_source"] = "metrics:sqi"
         if pq is None and "patch_sqi" in handle:
             pq = float(np.mean(handle["patch_sqi"][i]))
+            metadata["ppg_quality_source"] = "patch_sqi_mean"
         eq = float(handle["ecg_quality"][i]) if include_ecg and "ecg_quality" in handle else 1.0
+        if include_ecg and "ecg_quality" in handle:
+            metadata["ecg_quality_source"] = str(handle.attrs.get("ecg_quality_definition", "stored_unspecified"))
         pq = 1.0 if pq is None else pq
         if not np.isfinite(pq) or not 0 <= pq <= 1:
             pq = 0.0
