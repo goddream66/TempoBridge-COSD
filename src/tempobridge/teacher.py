@@ -17,6 +17,7 @@ class FrozenTeacher(nn.Module):
         super().__init__()
         self.fingerprint, self.kind = file_sha256(path), kind
         self.training_subjects = None
+        self.training_sources = None
         if kind == "native":
             checkpoint = load_checkpoint(path)
             if checkpoint.get("modality") != "ecg" or checkpoint.get("global_step", 0) < 1:
@@ -24,6 +25,7 @@ class FrozenTeacher(nn.Module):
             self.encoder = TempoBridge(ModelConfig.from_dict(checkpoint["model_config"]))
             self.encoder.load_state_dict(checkpoint["model"])
             self.training_subjects = checkpoint["train_subjects"]
+            self.training_sources = checkpoint.get("train_sources")
             self.input_fs = checkpoint["config"]["data"]["ecg_fs"]
             self.target_dim = self.encoder.config.dim
             self.feature_spec = {"layer": self.encoder.config.feature_layer,
@@ -39,6 +41,7 @@ class FrozenTeacher(nn.Module):
             if self.input_fs <= 0 or self.target_dim <= 0:
                 raise ValueError("Invalid external teacher sample rate or feature dimension")
             self.training_subjects = metadata.get("training_subjects")
+            self.training_sources = metadata.get("training_sources")
             self.feature_spec = {"adapter": metadata.get("feature_spec", "unspecified"),
                                  "dim": self.target_dim, "input_fs": self.input_fs,
                                  "kind": kind, "provenance": metadata["provenance"]}

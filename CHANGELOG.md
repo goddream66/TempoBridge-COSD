@@ -10,8 +10,12 @@
 - Direct low-dimensional ECG targets, independent weighting, soft direction-loss weights,
   vanilla statistics-only calibration and shared warm-up SSL continuation.
 - Fixed-step checkpoint option and sampled encoder-gradient diagnostics.
+- Dataset-level pairing controls, matched coverage/reliability and deterministic patient sampling.
+- Raw quality diagnostics, native-rate reference proxies and masked physiological supervision.
+- Provenance-rich features, frozen probes, full fine-tuning, group label fractions,
+  patient-cluster intervals, paired comparisons and strict source-held-out guards.
 - CPU tests for identity projection equivalence, patient isolation, cache relocation,
-  exact resume and PPG-only export; synthetic CLI verification.
+  exact resume and PPG-only export; core and downstream synthetic CLI verification.
 
 Remaining work is tracked in `docs/DEVELOPMENT_PLAN.md`. No clinical performance claims.
 

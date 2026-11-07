@@ -18,6 +18,15 @@ def main(argv=None):
     p.add_argument("--seconds", type=float, default=10)
     p.add_argument("--fs", type=int, default=100)
     p.add_argument("--seed", type=int, default=42)
+    p = sub.add_parser("finetune", help="PPG-only full downstream fine-tuning or random-init baseline")
+    for name in ("config", "manifest", "labels", "target", "output"):
+        p.add_argument("--" + name, required=True)
+    p.add_argument("--encoder", help="Exported pretrained encoder; omit for random initialization")
+    p.add_argument("--task", choices=["regression", "classification"], default="regression")
+    p.add_argument("--label-fraction", type=float, default=1.)
+    p.add_argument("--bootstrap-samples", type=int, default=200)
+    p.add_argument("--protocol", choices=["group_disjoint", "source_held_out"], default="group_disjoint")
+    p.add_argument("--target-source")
     p = sub.add_parser("audit-data", help="Validate manifest identities and signal shapes")
     p.add_argument("--manifest", required=True)
     p.add_argument("--config", required=True)
@@ -43,6 +52,9 @@ def main(argv=None):
     p.add_argument("--sources", required=True, help="JSON source roots, patterns and optional sample rates")
     p.add_argument("--output", required=True)
     p.add_argument("--pulsebound-split", help="Verify/reuse an original group_split_manifest.json")
+    p = sub.add_parser("reference-targets", help="Extract masked heuristic targets from independent native-rate reference windows")
+    p.add_argument("--references", required=True, help="JSONL: sample_id,path,duration_seconds; NPZ with ECG/ABP/RESP")
+    p.add_argument("--output", required=True, help="Long-format target CSV")
     for name in ("pretrain", "distill", "calibrate", "cache-features"):
         p = sub.add_parser(name)
         p.add_argument("--config", required=True)
@@ -51,6 +63,7 @@ def main(argv=None):
         if name == "pretrain":
             p.add_argument("--modality", choices=["ppg", "ecg"], required=True)
             p.add_argument("--student", help="Continue PPG-only SSL from the shared warm-up checkpoint")
+            p.add_argument("--reference-targets", help="Independent target CSV; requires transfer_method=physio")
         else:
             p.add_argument("--student", required=True)
             p.add_argument("--teacher", required=True)
@@ -76,9 +89,29 @@ def main(argv=None):
     p.add_argument("--split", choices=["train", "val", "test"], default="test")
     p.add_argument("--device", default="cpu")
     p.add_argument("--batch-size", type=int, default=32)
+    p = sub.add_parser("evaluate-probe", help="Patient-disjoint frozen linear probe with validation-only selection")
+    for name in ("train-features", "val-features", "test-features", "labels", "target", "output"):
+        p.add_argument("--" + name, required=True)
+    p.add_argument("--task", choices=["regression", "classification"], default="regression")
+    p.add_argument("--label-fraction", type=float, default=1.)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--regularizations", type=float, nargs="+", default=[.1, 1., 10.])
+    p.add_argument("--bootstrap-samples", type=int, default=200)
+    p.add_argument("--protocol", choices=["group_disjoint", "source_held_out"], default="group_disjoint")
+    p.add_argument("--target-source")
+    p.add_argument("--steps", type=int, default=300, help="Classification probe optimizer steps")
+    p = sub.add_parser("compare-predictions", help="Paired patient-cluster comparison on identical test support")
+    p.add_argument("--first", required=True)
+    p.add_argument("--second", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--bootstrap-samples", type=int, default=200)
+    p.add_argument("--seed", type=int, default=42)
     args = parser.parse_args(argv)
     if args.command == "synthetic":
         result = make_synthetic(args.output, args.subjects, args.windows, args.seconds, args.fs, args.seed)
+    elif args.command == "reference-targets":
+        from .physio_targets import build_reference_targets
+        result = build_reference_targets(args.references, args.output)
     elif args.command == "preprocess":
         from .preprocess import PreprocessConfig, preprocess_raw
         config = PreprocessConfig(**{name: getattr(args, name) for name in PreprocessConfig.__dataclass_fields__})
@@ -132,9 +165,24 @@ def main(argv=None):
                        teacher_path=getattr(args, "teacher", None),
                        calibration_path=getattr(args, "calibration", None),
                        teacher_kind=getattr(args, "teacher_kind", "native"),
-                       resume=args.resume, stop_after=args.stop_after)
+                       resume=args.resume, stop_after=args.stop_after,
+                       reference_targets_path=getattr(args, "reference_targets", None))
     elif args.command == "export":
         result = export_encoder(args.checkpoint, args.output)
+    elif args.command == "evaluate-probe":
+        from .evaluation import evaluate_probe
+        result = evaluate_probe(args.train_features, args.val_features, args.test_features, args.labels,
+                                args.target, args.output, args.task, args.label_fraction, args.seed,
+                                args.regularizations, args.bootstrap_samples, args.protocol,
+                                args.target_source, args.steps)
+    elif args.command == "compare-predictions":
+        from .evaluation import compare_predictions
+        result = compare_predictions(args.first, args.second, args.output, args.bootstrap_samples, args.seed)
+    elif args.command == "finetune":
+        from .finetuning import fine_tune
+        result = fine_tune(ExperimentConfig.load(args.config), args.manifest, args.labels, args.target,
+                           args.output, args.encoder, args.task, args.label_fraction, args.bootstrap_samples,
+                           args.protocol, args.target_source)
     else:
         result = extract_features(args.checkpoint, args.manifest, args.output,
                                   args.split, args.device, args.batch_size)

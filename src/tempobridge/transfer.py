@@ -4,6 +4,21 @@ import torch
 from torch.nn import functional as F
 
 
+def physiological_loss(model, heads, normalizer, ppg, values, valid, scale_index, protect_shallow):
+    valid = valid.bool()
+    active = valid.any(-1)
+    metrics = {"mean_transfer_weight": float(valid.float().mean()),
+               "paired_fraction": 0., "active_transfer_fraction": float(active.float().mean()),
+               "target_rank": float(valid.shape[1])}
+    if not active.any():
+        return ppg.new_zeros(()), metrics
+    target = normalizer(values[active])
+    prediction = heads(model.transfer_features(ppg[active], detach_shallow=protect_shallow), scale_index)
+    error = F.smooth_l1_loss(prediction.float(), target, reduction="none")
+    # Fixed target and batch denominators. Missing targets contribute exactly zero.
+    return (error * valid[active]).sum() / valid.numel(), metrics
+
+
 def distillation_loss(model, heads, teacher, calibrator, ppg, ecg, valid,
                       ppg_quality, ecg_quality, scale_index, mode, protect_shallow):
     rank = calibrator.output_dims[scale_index]

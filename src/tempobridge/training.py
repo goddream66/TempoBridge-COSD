@@ -13,11 +13,11 @@ from torch.utils.data import DataLoader
 
 from .calibration import CalibrationWeights
 from .config import DataConfig, ExperimentConfig, ModelConfig
-from .data import PairedDataset, manifest_digest, read_manifest, split_size, subject_ids
+from .data import PairedDataset, manifest_digest, read_manifest, source_ids, split_size, subject_ids
 from .model import TempoBridge, TransferHeads, random_mask, reconstruction_loss
 from .sampling import PatientSourceSampler, SourceBlockSampler
 from .teacher import FrozenTeacher
-from .transfer import distillation_loss, gradient_audit
+from .transfer import distillation_loss, gradient_audit, physiological_loss
 from .utils import (
     device_for,
     environment,
@@ -60,13 +60,18 @@ def batch_loss(config, model, batch, device, modality, heads=None, teacher=None,
         mask = random_mask(wave, model.config.patch_size, config.train.mask_ratio)
         ssl.append(reconstruction_loss(model, wave, mask, config.train.morphology_loss_weight))
         if heads is not None and config.train.transfer_mode != "none" and config.train.transfer_method != "none":
-            loss, terms = distillation_loss(
-                model, heads, teacher, calibrator,
-                batch["ppg"][index].to(device), batch["ecg"][index].to(device),
-                batch["ecg_valid"].to(device), batch["ppg_quality"].to(device),
-                batch["ecg_quality"].to(device), index,
-                config.train.transfer_mode, config.train.protect_shallow,
-            )
+            if config.train.transfer_method == "physio":
+                loss, terms = physiological_loss(model, heads, calibrator, batch["ppg"][index].to(device),
+                    batch["reference_values"].to(device), batch["reference_valid"].to(device),
+                    index, config.train.protect_shallow)
+            else:
+                loss, terms = distillation_loss(
+                    model, heads, teacher, calibrator,
+                    batch["ppg"][index].to(device), batch["ecg"][index].to(device),
+                    batch["ecg_valid"].to(device), batch["ppg_quality"].to(device),
+                    batch["ecg_quality"].to(device), index,
+                    config.train.transfer_mode, config.train.protect_shallow,
+                )
             kd.append(loss)
             transfer_metrics.append(terms)
     self_loss = torch.stack(ssl).mean()
@@ -108,7 +113,8 @@ def evaluate_reconstruction(config, model, records, device, modality="ppg"):
 
 
 def train(config, manifest, output, modality="ppg", student_path=None, teacher_path=None,
-          calibration_path=None, teacher_kind="native", resume=None, stop_after=None):
+          calibration_path=None, teacher_kind="native", resume=None, stop_after=None,
+          reference_targets_path=None):
     config.validate()
     seed_all(config.train.seed, config.train.threads)
     device = device_for(config.train.device)
@@ -118,7 +124,12 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
     if (output / "last.pt").exists() and resume is None:
         raise FileExistsError("Run already has last.pt; use --resume or another output directory")
     output.mkdir(parents=True, exist_ok=True)
-    stage = "distill" if teacher_path else "pretrain"
+    stage = "physio" if reference_targets_path else "distill" if teacher_path else "pretrain"
+    if config.train.transfer_method == "physio" and stage != "physio":
+        raise ValueError("Physio method requires --reference-targets")
+    if stage == "physio" and (teacher_path or calibration_path or modality != "ppg" or
+                              config.train.transfer_method != "physio"):
+        raise ValueError("Reference supervision requires PPG/physio, without a neural teacher/calibration")
     if stage == "distill" and (modality != "ppg" or not student_path):
         raise ValueError("Distillation requires PPG warm-up")
     if stage == "distill" and config.train.transfer_method == "none":
@@ -128,7 +139,7 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
     model = TempoBridge(config.model).to(device)
     teacher, calibrator, heads = None, None, None
     provenance = {"student_sha256": None, "teacher_sha256": None, "calibration_sha256": None,
-                  "teacher_kind": teacher_kind if teacher_path else None}
+                  "teacher_kind": teacher_kind if teacher_path else None, "reference_sha256": None}
     if student_path:
         initial = load_checkpoint(student_path)
         if asdict(ModelConfig.from_dict(initial["model_config"])) != config.to_dict()["model"] or initial["modality"] != "ppg":
@@ -157,6 +168,20 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
         if config.train.transfer_mode == "calibrated" and not (calibrator.weights > 0).any():
             print("NOTICE: all calibrated weights are zero; retaining PPG self-supervision only.", flush=True)
     dataset = PairedDataset(records, config.data, seed=config.train.seed)
+    if stage == "physio":
+        from .physio_targets import (
+            ReferenceDataset,
+            ReferenceNormalizer,
+            TargetTable,
+            reference_statistics,
+        )
+        table = TargetTable(reference_targets_path)
+        statistics = reference_statistics(dataset, table, config.train.physio_targets)
+        write_json(output / "reference_statistics.json", statistics)
+        calibrator = ReferenceNormalizer(statistics).to(device)
+        heads = TransferHeads(config.model.dim, len(config.train.physio_targets), config.data.scales_seconds).to(device)
+        provenance["reference_sha256"] = table.fingerprint
+        dataset = ReferenceDataset(dataset, table, config.train.physio_targets)
     if stage == "distill" and config.train.pairing_control != "none":
         from .controls import PairingControlDataset
         dataset = PairingControlDataset(dataset, config.train, config.data.quality_edges)
@@ -189,6 +214,7 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
     if resume:
         saved = load_checkpoint(resume)
         saved["config"] = ExperimentConfig.from_dict(saved["config"]).to_dict()
+        saved["provenance"].setdefault("reference_sha256", None)
         for key, expected in {"config": config.to_dict(), "manifest_sha256": digest,
                               "stage": stage, "modality": modality, "provenance": provenance}.items():
             if saved[key] != expected:
@@ -208,6 +234,7 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
     write_json(output / "provenance.json", {**provenance, "manifest_sha256": digest,
                "stage": stage, "modality": modality,
                "train_subjects": sorted(subject_ids(records, "train")),
+               "train_sources": sorted(source_ids(records, "train")),
                "epoch_source_counts": sampler.counts if sampler is not None else None})
     for epoch in range(first_epoch, config.train.epochs):
         started = time.monotonic()
@@ -267,6 +294,9 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
             "epoch": epoch, "global_step": global_step, "best_val": best,
             "manifest_sha256": digest, "provenance": provenance,
             "train_subjects": sorted(subject_ids(records, "train")),
+            "train_sources": sorted(source_ids(records, "train")),
+            "teacher_training_subjects": teacher.training_subjects if teacher else [],
+            "teacher_training_sources": teacher.training_sources if teacher else [],
             "rng_cpu": torch.get_rng_state(),
             "rng_cuda": torch.cuda.get_rng_state_all() if device.type == "cuda" else [],
         }

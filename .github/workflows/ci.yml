@@ -13,3 +13,5 @@ jobs:
       - run: ruff check .
       - run: pytest -q
       - run: python scripts/smoke.py --output runs/ci-smoke
+      - run: python scripts/smoke_cosd.py --output runs/ci-cosd
+      - run: python scripts/smoke_downstream.py --output runs/ci-downstream

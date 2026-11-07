@@ -18,6 +18,7 @@ from scipy.special import expit
 from scipy.stats import skew
 
 from .h5data import canonical_hash, h5py_module
+from .quality import DIAGNOSTIC_VERSION, waveform_diagnostics
 from .utils import write_json
 
 
@@ -82,6 +83,9 @@ def clean_window(ppg, ecg, fs, config):
         return None, "source_fs"
     if len(ppg) != round(config.window_seconds * fs):
         return None, "incomplete_window"
+    diagnostics = {f"{modality}_raw_{key}": value
+                   for modality, wave in (("ppg", ppg), ("ecg", ecg))
+                   for key, value in waveform_diagnostics(wave, fs).items()}
     ppg, missing_ppg, reason = clean_finite(ppg, config.max_missing_fraction)
     if reason:
         return None, "ppg_" + reason
@@ -115,7 +119,7 @@ def clean_window(ppg, ecg, fs, config):
             "patch_sqi": quality, "ppg_quality": spectral_sqi(ppg, fs),
             "ecg_quality": 1 - missing_ecg if ecg is not None else 0.0,
             "ppg_missing_fraction": missing_ppg, "ecg_missing_fraction": missing_ecg,
-            "ecg_rejection": ecg_reason or ""}, None
+            "ecg_rejection": ecg_reason or "", **diagnostics}, None
 
 
 def discover_wfdb(root):
@@ -238,7 +242,9 @@ class ShardWriter:
                                      window_length=self.config.window_seconds,
                                      patch_length_sec=self.config.quality_patch_seconds,
                                      preprocessing_contract=self.contract,
-                                     converter="tempobridge_strict_v1")
+                                     converter="tempobridge_strict_v2",
+                                     quality_diagnostics=DIAGNOSTIC_VERSION,
+                                     ecg_quality_definition="finite_coverage_not_calibrated_sqi")
         for key, value in sample.items():
             array = np.asarray(value)
             if key not in self.handle:
@@ -293,6 +299,7 @@ def preprocess_raw(kind, root, output, config=None, source=None, id_map=None, re
     companions = [(p.relative_to(root).as_posix(), p.stat().st_size, p.stat().st_mtime_ns)
                   for p in sorted(root.rglob("*.dat"))] if kind == "mimic" else []
     contract_data = {"kind": kind, "source": source, "config": asdict(config),
+                     "converter_version": 2, "quality_diagnostics": DIAGNOSTIC_VERSION,
                      "records": inventory, "companions": companions, "id_map": identities}
     contract = canonical_hash(contract_data)
     contract_path = output / "conversion_contract.json"

@@ -58,8 +58,19 @@ No real-data training or GPU training is authorized for this development task; v
   donors; matched correct-pair coverage and conservative common ECG reliability; real timestamps;
   deterministic source/group/record/window sampling. Initial targeted checks: 45 passed. Follow-up
   10 control tests passed, including bit-exact interrupted/resumed training on all three encoders.
-- Still required: quality/reference
-  target pipeline; downstream evaluation and ablation runner; final organization/CI/package/rename audit.
+- Iteration 4 implemented: raw quality diagnostics (converter contract v2); native-rate
+  ECG/ABP/RESP heuristic references and external scalar label import; masked physiological
+  supervision with train-only normalization and exact pretraining resume; metadata-rich exports;
+  frozen regression/classification probes, whole-group label fractions, full fine-tuning and
+  random initialization; paired group bootstrap and source-held-out provenance guards.
+- CPU full suite: 251 passed, 14 existing dependency warnings, 79.03 seconds. Separate downstream
+  CLI completed reference extraction, physiological pretraining, export, all-split features,
+  regression/classification probes, paired comparison and pretrained/random full fine-tuning:
+  `runs/cosd_validation/downstream_cli_20261107/summary.json`. These are synthetic fixtures only.
+- Follow-up resume-metadata and paired-support validation changes: 29 targeted checks passed;
+  all 19 experiment configurations load; Ruff and `git diff --check` passed.
+- Still required: representation/source/quality audit commands; complete experiment matrix and
+  matched-budget/rank/weight orchestration; final organization/CI/package/rename audit.
   The directory remains `TempoBridge_backbone` until the final relocation checks.
 
 ## Organization references

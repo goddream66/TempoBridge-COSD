@@ -119,6 +119,12 @@ def split_size(records, split):
     return records.counts[split] if hasattr(records, "counts") else sum(r.split == split for r in records)
 
 
+def source_ids(records, split):
+    if hasattr(records, "segments"):
+        return {segment[5] for segment in records.segments if segment[4] == split}
+    return {record.source for record in records if record.split == split}
+
+
 def subject_ids(records, split):
     if hasattr(records, "subjects"):
         return records.subjects(split)

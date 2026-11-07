@@ -143,6 +143,7 @@ class TrainConfig:
     pairing_shift_seconds: float = 30.0
     pairing_quality_match: bool = False
     pairing_weight_match: bool = True
+    physio_targets: list[str] = field(default_factory=lambda: ["hr_bpm"])
 
 
 @dataclass
@@ -223,10 +224,17 @@ class ExperimentConfig:
             raise ValueError("Loss weights must be nonnegative")
         if t.transfer_mode not in {"calibrated", "all", "quality", "random", "none"}:
             raise ValueError("Unknown transfer_mode")
-        if t.transfer_method not in {"none", "vanilla", "pw_kd", "cosd"}:
+        if t.transfer_method not in {"none", "vanilla", "pw_kd", "cosd", "physio"}:
             raise ValueError("Unknown transfer_method")
         if t.transfer_method == "vanilla" and t.transfer_mode not in {"all", "quality"}:
             raise ValueError("Vanilla KD uses transfer_mode all or quality, without OOF weights")
+        if not t.physio_targets or len(set(t.physio_targets)) != len(t.physio_targets) or any(
+            not isinstance(name, str) or not name.strip() for name in t.physio_targets
+        ):
+            raise ValueError("physio_targets must be distinct nonempty names")
+        if t.transfer_method == "physio" and (d.window_mode != "full" or
+                t.transfer_mode != "all" or t.pairing_control != "none"):
+            raise ValueError("Physiological references require full windows, mode all, no ECG pairing control")
         if t.checkpoint_selection not in {"reconstruction", "last"}:
             raise ValueError("checkpoint_selection must be reconstruction or last")
         if type(t.gradient_audit_interval) is not int or t.gradient_audit_interval < 0:

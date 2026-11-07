@@ -1,4 +1,8 @@
-# TempoBridge
+# TempoBridge-COSD
+
+COSD 迭代已加入教师方向筛选、投影目标蒸馏、生理指标监督基线和下游评估。
+实现与边界见 [COSD](docs/COSD.md)，运行命令见 [生理参考与评估](docs/EVALUATION.md)，
+完整迭代状态见 [开发记录](docs/DEVELOPMENT_PLAN.md)。Python 包名保持 `tempobridge`。
 
 **ECG 辅助训练、PPG 单模态推理的时间尺度校准基础模型研究基座。**
 

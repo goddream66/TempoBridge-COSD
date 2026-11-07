@@ -31,13 +31,30 @@ CSV source/time/case/quality-provenance metadata now participates in artifact id
 ## Experiments
 
 Legacy `transfer_mode` remains the weighting axis. `transfer_method` selects the target workflow:
-`none`, `vanilla`, `pw_kd`, or `cosd`. Vanilla requires weighting `all` or `quality` and can
+`none`, `vanilla`, `pw_kd`, `cosd`, or `physio`. Vanilla requires weighting `all` or `quality` and can
 generate target statistics automatically without OOF probes. COSD requires a schema-3 artifact.
 An empty selected subspace disables KD while retaining PPG self-supervision.
 
 `checkpoint_selection=reconstruction` preserves the old selection behavior;
 `last` makes `best.pt` the fixed-budget endpoint. Both always save `last.pt`.
 Resume checks bind optimizer/head state to the exact run configuration and calibration.
+
+`physio` uses an independent reference-target CSV and no neural teacher. It requires
+full windows and `transfer_mode=all`; its label hash is part of resume identity.
+Earlier checkpoints without a reference hash are interpreted as `None`, not as
+permission to add new supervision to an existing optimizer schedule.
+
+## Evaluation and conversion
+
+New feature archives include provenance and identity/source metadata. Historical
+PPG encoder weights remain loadable, but old feature-only archives must be
+regenerated for the guarded evaluation commands. Unknown historical teacher or
+pretraining provenance remains unknown; strict source-held-out claims are rejected.
+
+Converter v2 adds pre-interpolation diagnostics and versions its conversion contract.
+Use a fresh destination for v2 output instead of mixing v1/v2 rows through resume.
+Existing v1 HDF5 shards remain readable. See `docs/EVALUATION.md` for reference labels,
+direct physiological supervision, frozen probes and full downstream fine-tuning.
 
 ## Portable use
 

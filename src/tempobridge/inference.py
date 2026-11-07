@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from .config import DataConfig, ModelConfig
-from .data import PairedDataset, read_manifest
+from .data import PairedDataset, manifest_digest, read_manifest
 from .model import TempoBridge
 from .utils import file_sha256, load_checkpoint, save_checkpoint
 
@@ -23,6 +23,11 @@ def export_encoder(checkpoint, output):
     save_checkpoint(output, {"format_version": 1, "kind": "ppg_encoder",
                     "model_config": state["model_config"], "model": weights,
                     "data_config": state["config"]["data"],
+                    "pretraining_provenance": {
+                        "train_subjects": state.get("train_subjects"), "train_sources": state.get("train_sources"),
+                        "teacher_training_subjects": state.get("teacher_training_subjects"),
+                        "teacher_training_sources": state.get("teacher_training_sources"),
+                        "manifest_sha256": state.get("manifest_sha256")},
                     "source_sha256": file_sha256(checkpoint)})
     return Path(output)
 
@@ -52,13 +57,23 @@ def extract_features(checkpoint, manifest, output, split="test", device="cpu", b
     loader = DataLoader(dataset, batch_size=batch_size)
     model = load_encoder(checkpoint, device)
     scale = int(np.argmax(config.scales_seconds))
-    values, ids, subjects = [], [], []
+    values = []
+    fields = {k: [] for k in ("sample_id", "subject_id", "source", "recording_id", "case_id",
+                               "window_start_s", "ppg_quality", "ecg_quality", "subject_known",
+                               "identity_level", "recording_known")}
     for batch in loader:
         values.append(model(batch["ppg"][scale].to(device)).cpu().numpy())
-        ids.extend(batch["sample_id"])
-        subjects.extend(batch["subject_id"])
+        for key in fields:
+            item = batch[key]
+            fields[key].extend(item.tolist() if isinstance(item, torch.Tensor) else item)
     dataset.close()
     Path(output).parent.mkdir(parents=True, exist_ok=True)
-    np.savez(output, embedding=np.concatenate(values), sample_id=np.asarray(ids),
-             subject_id=np.asarray(subjects), scale_seconds=config.scales_seconds[scale])
+    if not values:
+        raise ValueError(f"No feature rows in split {split}")
+    import json
+    metadata = {"schema_version": 2, "split": split,
+                "encoder_sha256": file_sha256(checkpoint), "manifest_sha256": manifest_digest(records),
+                "pretraining": state.get("pretraining_provenance", {})}
+    np.savez(output, embedding=np.concatenate(values), **{k: np.asarray(v) for k, v in fields.items()},
+             scale_seconds=config.scales_seconds[scale], metadata_json=json.dumps(metadata))
     return Path(output)
