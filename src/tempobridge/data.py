@@ -167,13 +167,29 @@ class PairedDataset(Dataset):
     def set_epoch(self, epoch):
         self.epoch = epoch
 
+    def metadata(self, index):
+        """Identity/availability index without materializing waveform arrays."""
+        record = self.records[index]
+        row = {"sample_id": record.sample_id, "subject_id": record.subject_id,
+               "subject_known": record.subject_known, "source": record.source,
+               "recording_id": record.recording_id, "recording_known": record.recording_known,
+               "window_start_s": record.window_start_s, "ppg_quality": record.ppg_quality,
+               "identity_level": "subject_id" if record.subject_known else "unknown"}
+        if record.h5_row is not None:
+            row.update(self.h5_reader.metadata(record))
+        else:
+            with np.load(record.path, allow_pickle=False) as data:
+                row["ecg_available"] = "ecg" in data
+        return row
+
     def __getitem__(self, index):
         record = self.records[index]
         pq, eq = record.ppg_quality, record.ecg_quality
         metadata = {"recording_id": record.recording_id, "recording_known": record.recording_known,
                     "window_start_s": record.window_start_s, "case_id": record.case_id,
                     "ppg_quality_source": record.ppg_quality_source,
-                    "ecg_quality_source": record.ecg_quality_source}
+                    "ecg_quality_source": record.ecg_quality_source,
+                    "identity_level": "subject_id" if record.subject_known else "unknown"}
         if record.h5_row is not None:
             data, pq, eq = self.h5_reader.read(record, self.include_ecg)
             metadata.update(data.get("metadata", {}))
@@ -216,11 +232,11 @@ class PairedDataset(Dataset):
             ecg_crops.append(torch.from_numpy(e)[None])
         return {
             "ppg": ppg_crops, "ecg": ecg_crops, "ecg_valid": ecg is not None,
-            "ppg_quality": pq, "ecg_quality": eq,
             "subject_id": record.subject_id, "recording_id": record.recording_id,
             "sample_id": record.sample_id,
             "source": record.source, "subject_known": record.subject_known,
             "crop_offsets_s": crop_offsets, **metadata,
+            "ppg_quality": pq, "ecg_quality": eq,
         }
 
     def close(self):
@@ -255,6 +271,7 @@ def make_synthetic(output, subjects=18, windows=6, seconds=10, fs=100, seed=42):
             np.savez(output / f"{name}.npz", **fields)
             rows.append(dict(sample_id=name, subject_id=f"s{person:03d}",
                              recording_id=f"r{person:03d}", split=split, path=f"{name}.npz",
+                             window_start_s=window * seconds,
                              ppg_quality=quality, ecg_quality=0.95))
     with (output / "manifest.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))

@@ -15,7 +15,7 @@ from .calibration import CalibrationWeights
 from .config import DataConfig, ExperimentConfig, ModelConfig
 from .data import PairedDataset, manifest_digest, read_manifest, split_size, subject_ids
 from .model import TempoBridge, TransferHeads, random_mask, reconstruction_loss
-from .sampling import SourceBlockSampler
+from .sampling import PatientSourceSampler, SourceBlockSampler
 from .teacher import FrozenTeacher
 from .transfer import distillation_loss, gradient_audit
 from .utils import (
@@ -76,6 +76,7 @@ def batch_loss(config, model, batch, device, modality, heads=None, teacher=None,
     metrics = {name: sum(m[name] for m in transfer_metrics) / len(transfer_metrics)
                if transfer_metrics else 0. for name in names}
     metrics["paired_fraction"] = float(batch["ecg_valid"][keep].float().mean())
+    metrics["original_paired_fraction"] = float(batch.get("original_ecg_valid", batch["ecg_valid"])[keep].float().mean())
     if audit_gradients:
         metrics.update(gradient_audit(self_loss, distillation, model, config.train.transfer_weight))
     return total, {"ssl": float(self_loss.detach()), "transfer": float(distillation.detach()),
@@ -156,11 +157,18 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
         if config.train.transfer_mode == "calibrated" and not (calibrator.weights > 0).any():
             print("NOTICE: all calibrated weights are zero; retaining PPG self-supervision only.", flush=True)
     dataset = PairedDataset(records, config.data, seed=config.train.seed)
+    if stage == "distill" and config.train.pairing_control != "none":
+        from .controls import PairingControlDataset
+        dataset = PairingControlDataset(dataset, config.train, config.data.quality_edges)
     use_block_sampler = hasattr(dataset.records, "segments") or bool(config.data.source_weights)
-    sampler = (SourceBlockSampler(dataset.records, config.data, config.train.batch_size,
-                                  config.train.accumulation, config.train.seed)
-               if use_block_sampler else None)
-    if config.data.samples_per_epoch and not use_block_sampler:
+    if config.data.sampler == "patient":
+        sampler = PatientSourceSampler(dataset, config.data, config.train.batch_size,
+                                        config.train.accumulation, config.train.seed)
+    else:
+        sampler = (SourceBlockSampler(dataset.records, config.data, config.train.batch_size,
+                                      config.train.accumulation, config.train.seed)
+                   if use_block_sampler else None)
+    if config.data.samples_per_epoch and sampler is None:
         raise ValueError("samples_per_epoch requires explicit source_weights")
     parameters = list(model.parameters()) + (list(heads.parameters()) if heads else [])
     optimizer = torch.optim.AdamW(parameters, lr=config.train.lr, weight_decay=config.train.weight_decay)
@@ -204,6 +212,8 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
     for epoch in range(first_epoch, config.train.epochs):
         started = time.monotonic()
         dataset.set_epoch(epoch)
+        if hasattr(dataset, "report"):
+            write_json(output / f"pairing_epoch_{epoch:04}.json", dataset.report())
         if sampler is not None:
             sampler.epoch = epoch
         loader = DataLoader(dataset, batch_size=config.train.batch_size,
@@ -214,7 +224,8 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
         if heads:
             heads.train()
         metrics, examples = {name: 0. for name in ("loss", "ssl", "transfer", "mean_transfer_weight",
-                                                  "paired_fraction", "active_transfer_fraction", "target_rank")}, 0
+                                                  "paired_fraction", "original_paired_fraction",
+                                                  "active_transfer_fraction", "target_rank")}, 0
         iterator = iter(loader)
         while group := list(itertools.islice(iterator, config.train.accumulation)):
             counts = [int(b["ecg_valid"].sum()) if modality == "ecg" else len(b["ecg_valid"]) for b in group]
@@ -269,11 +280,14 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
             if key in metrics:
                 row[key] = metrics[key] / max(metrics["gradient_audit_fraction"], 1.)
         row["paired_windows"] = metrics["paired_fraction"]
+        row["original_paired_windows"] = metrics["original_paired_fraction"]
         row["active_transfer_windows"] = metrics["active_transfer_fraction"]
         row["transfer_weight_sum"] = metrics["mean_transfer_weight"]
         with (output / "metrics.jsonl").open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, allow_nan=False) + "\n")
         print(json.dumps(row), flush=True)
+        if isinstance(sampler, PatientSourceSampler):
+            write_json(output / f"sampling_epoch_{epoch:04}.json", sampler.last_report)
         if stop_after is not None and epoch + 1 >= stop_after:
             break
     if teacher and (teacher.training or any(p.requires_grad for p in teacher.parameters())):

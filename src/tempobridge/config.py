@@ -98,6 +98,7 @@ class DataConfig:
     source_weights: dict[str, float] = field(default_factory=dict)
     samples_per_epoch: int = 0
     shuffle_block_size: int = 256
+    sampler: str = "source"
 
     @classmethod
     def from_dict(cls, values):
@@ -137,6 +138,11 @@ class TrainConfig:
     transfer_method: str = "pw_kd"
     checkpoint_selection: str = "reconstruction"
     gradient_audit_interval: int = 0
+    pairing_control: str = "none"
+    pairing_apply: bool = True
+    pairing_shift_seconds: float = 30.0
+    pairing_quality_match: bool = False
+    pairing_weight_match: bool = True
 
 
 @dataclass
@@ -182,6 +188,8 @@ class ExperimentConfig:
             raise ValueError("Invalid sample rates/workers")
         if d.integrity not in {"sha256", "metadata"} or d.max_open_shards < 1 or d.shuffle_block_size < 1:
             raise ValueError("Invalid HDF5 integrity/cache/shuffle settings")
+        if d.sampler not in {"source", "patient"}:
+            raise ValueError("sampler must be source or patient")
         if d.samples_per_epoch < 0 or any(not 0 < w < float("inf") for w in d.source_weights.values()):
             raise ValueError("Invalid epoch size or source weights")
         if not d.scales_seconds or len(set(d.scales_seconds)) != len(d.scales_seconds):
@@ -223,6 +231,14 @@ class ExperimentConfig:
             raise ValueError("checkpoint_selection must be reconstruction or last")
         if type(t.gradient_audit_interval) is not int or t.gradient_audit_interval < 0:
             raise ValueError("gradient_audit_interval must be a nonnegative number of optimizer steps")
+        if t.pairing_control not in {"none", "within_record", "cross_patient", "cross_source", "time_shift"}:
+            raise ValueError("Unknown pairing_control")
+        if any(type(v) is not bool for v in (t.pairing_apply, t.pairing_quality_match, t.pairing_weight_match)):
+            raise ValueError("Pairing switches must be boolean")
+        if not abs(t.pairing_shift_seconds) < float("inf") or t.pairing_shift_seconds == 0:
+            raise ValueError("pairing_shift_seconds must be finite and nonzero")
+        if t.pairing_control == "time_shift" and d.window_mode != "full":
+            raise ValueError("time_shift controls require full windows with real timestamps")
         s = self.cosd
         if s.basis not in {"standardized", "pca", "random"}:
             raise ValueError("Unknown COSD basis")

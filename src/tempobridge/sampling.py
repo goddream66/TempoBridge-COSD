@@ -3,6 +3,7 @@
 import bisect
 import math
 import random
+from collections import defaultdict
 from fractions import Fraction
 
 import numpy as np
@@ -96,3 +97,60 @@ def calibration_indices(records, per_subject, seed):
             previous = int(ends[segment - 1]) if segment else 0
             selected.append(int(ranges[segment][0] + position - previous))
     return selected
+
+
+class PatientSourceSampler(Sampler):
+    """Exact source quotas, balanced groups, then uniform records/windows.
+
+Sampling is WITH replacement within records. Unknown identities form an explicit
+pool per source and are never counted as independent patients.
+"""
+    def __init__(self, dataset, config, batch_size, accumulation, seed, epoch=0):
+        self.seed, self.epoch = seed, epoch
+        self.groups = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+        lengths = defaultdict(int)
+        for i in range(len(dataset)):
+            row = dataset.metadata(i)
+            source = row["source"]
+            patient = row["subject_id"] if row["subject_known"] else "__unknown_pool__"
+            record = row["recording_id"] if row["recording_known"] else "__unknown_record__"
+            self.groups[source][patient][record].append(i)
+            lengths[source] += 1
+        weights = config.source_weights or dict(lengths)
+        if set(weights) != set(lengths):
+            raise ValueError("Patient sampler weights must name every source")
+        ratios = {k: Fraction(str(v)).limit_denominator(10000) for k, v in weights.items()}
+        total = sum(ratios.values())
+        ratios = {k: v / total for k, v in ratios.items()}
+        unit = math.lcm(batch_size * accumulation, *(r.denominator for r in ratios.values()))
+        n = config.samples_per_epoch or sum(lengths.values()) // unit * unit
+        if n < unit or n % unit:
+            raise ValueError(f"Patient-sampled epoch must be a positive multiple of {unit}")
+        self.counts = {k: n * r.numerator // r.denominator for k, r in ratios.items()}
+        self.last_report = None
+
+    def __len__(self):
+        return sum(self.counts.values())
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        order, group_counts = [], {}
+        for source in sorted(self.groups):
+            patients = sorted(self.groups[source])
+            patient_order = []
+            while len(patient_order) < self.counts[source]:
+                patient_order.extend(rng.permutation(patients).tolist())
+            group_counts[source] = {p: 0 for p in patients}
+            for patient in patient_order[:self.counts[source]]:
+                records = self.groups[source][patient]
+                record = rng.choice(sorted(records))
+                order.append(int(rng.choice(records[record])))
+                group_counts[source][patient] += 1
+        rng.shuffle(order)
+        self.last_report = {"kind": "source/group/record/window sampling with replacement",
+                            "source_counts": self.counts, "group_counts": group_counts,
+                            "unique_windows": len(set(order)), "sampled_windows": len(order),
+                            "repeated_windows": len(order) - len(set(order)),
+                            "omitted_windows": sum(len(v) for src in self.groups.values()
+                                                   for rec in src.values() for v in rec.values()) - len(set(order))}
+        yield from order

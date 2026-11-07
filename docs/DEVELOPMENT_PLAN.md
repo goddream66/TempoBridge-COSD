@@ -54,7 +54,11 @@ No real-data training or GPU training is authorized for this development task; v
   `summary.json` confirms completion, including a nonzero COSD rank of 4 and finite KD gradients.
   This is not physiological efficacy evidence. A subsequent paired-count logging correction passed
   all 15 COSD training/gradient/resume/export tests; Ruff and `git diff --check` passed.
-- Still required: dataset-level pairing/time-shift controls; patient-aware sampling; quality/reference
+- Iteration 3 controls implemented: dataset-level within-record/cross-patient/cross-source/time-shift
+  donors; matched correct-pair coverage and conservative common ECG reliability; real timestamps;
+  deterministic source/group/record/window sampling. Initial targeted checks: 45 passed. Follow-up
+  10 control tests passed, including bit-exact interrupted/resumed training on all three encoders.
+- Still required: quality/reference
   target pipeline; downstream evaluation and ablation runner; final organization/CI/package/rename audit.
   The directory remains `TempoBridge_backbone` until the final relocation checks.
 

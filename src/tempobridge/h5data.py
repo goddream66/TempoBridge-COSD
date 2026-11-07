@@ -321,7 +321,7 @@ class H5Reader:
     def __del__(self):
         self.close()
 
-    def read(self, record, include_ecg=True):
+    def _handle(self, record):
         if self.pid != os.getpid():
             self.close()
             self.pid = os.getpid()
@@ -333,8 +333,11 @@ class H5Reader:
         self.handles[key] = handle
         while len(self.handles) > self.maximum:
             self.handles.popitem(last=False)[1].close()
+        return handle
+
+    def metadata(self, record):
+        handle = self._handle(record)
         i = record.h5_row
-        result = {"ppg": handle["signals"][i], "ppg_fs": record.stored_fs}
         metadata = {"recording_id": "", "recording_known": False, "window_start_s": -1.0,
                     "case_id": "", "ppg_quality_source": "unknown", "ecg_quality_source": "unknown"}
         for field in ("record_key", "record_id"):
@@ -350,7 +353,30 @@ class H5Reader:
             value = float(handle["window_start_s"][i])
             if np.isfinite(value) and value >= 0:
                 metadata["window_start_s"] = value
-        result["metadata"] = metadata
+        metadata["ecg_available"] = "ecg_wave" in handle and ("has_ecg" not in handle or bool(handle["has_ecg"][i]))
+        metadata["ppg_quality"] = float(handle["ppg_quality"][i]) if "ppg_quality" in handle else 1.0
+        if "ppg_quality" not in handle:
+            names = handle.attrs.get("metric_keys", "")
+            names = names.decode() if isinstance(names, bytes) else names
+            names = names.split(",") if isinstance(names, str) else list(names)
+            if "metrics" in handle and "sqi" in names:
+                metadata["ppg_quality"] = float(handle["metrics"][i, names.index("sqi")])
+            elif "patch_sqi" in handle:
+                metadata["ppg_quality"] = float(np.mean(handle["patch_sqi"][i]))
+        if not np.isfinite(metadata["ppg_quality"]) or not 0 <= metadata["ppg_quality"] <= 1:
+            metadata["ppg_quality"] = 0.
+        metadata["identity_level"] = "unknown"
+        for field in ID_KEYS:
+            if field in handle and normalize_identifier(handle[field][i]) is not None:
+                metadata["identity_level"] = field
+                break
+        return metadata
+
+    def read(self, record, include_ecg=True):
+        handle = self._handle(record)
+        i = record.h5_row
+        metadata = self.metadata(record)
+        result = {"ppg": handle["signals"][i], "ppg_fs": record.stored_fs, "metadata": metadata}
         if not np.isfinite(result["ppg"]).all() or np.ptp(result["ppg"]) <= 1e-8:
             raise ValueError(f"Invalid PPG in {record.sample_id}; repair/reconvert the shard before training")
         available = include_ecg and "ecg_wave" in handle and ("has_ecg" not in handle or bool(handle["has_ecg"][i]))
