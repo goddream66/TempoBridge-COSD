@@ -43,22 +43,29 @@ def main(argv=None):
     p.add_argument("--sources", required=True, help="JSON source roots, patterns and optional sample rates")
     p.add_argument("--output", required=True)
     p.add_argument("--pulsebound-split", help="Verify/reuse an original group_split_manifest.json")
-    for name in ("pretrain", "distill", "calibrate"):
+    for name in ("pretrain", "distill", "calibrate", "cache-features"):
         p = sub.add_parser(name)
         p.add_argument("--config", required=True)
         p.add_argument("--manifest", required=True)
         p.add_argument("--output", required=True)
         if name == "pretrain":
             p.add_argument("--modality", choices=["ppg", "ecg"], required=True)
+            p.add_argument("--student", help="Continue PPG-only SSL from the shared warm-up checkpoint")
         else:
             p.add_argument("--student", required=True)
             p.add_argument("--teacher", required=True)
             p.add_argument("--teacher-kind", choices=["native", "torchscript"], default="native")
         if name == "distill":
-            p.add_argument("--calibration", required=True)
-        if name != "calibrate":
+            p.add_argument("--calibration", help="Required for PW-KD/COSD; vanilla computes target statistics only")
+        if name == "calibrate":
+            p.add_argument("--cache", help="Reuse a fingerprint-verified frozen-feature cache")
+        if name in {"pretrain", "distill"}:
             p.add_argument("--resume")
             p.add_argument("--stop-after", type=int, help="Stop after this epoch; keep the configured schedule for exact resume")
+    p = sub.add_parser("calibrate-cache", help="Calibrate from an existing verified training feature cache")
+    p.add_argument("--config", required=True)
+    p.add_argument("--cache", required=True)
+    p.add_argument("--output", required=True)
     p = sub.add_parser("export")
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--output", required=True)
@@ -105,8 +112,19 @@ def main(argv=None):
         result = json.dumps(counts)
     elif args.command == "calibrate":
         artifact = calibrate(ExperimentConfig.load(args.config), args.manifest, args.student,
-                             args.teacher, args.output, args.teacher_kind)
-        result = json.dumps({"output": args.output, "weights": [s["weights"] for s in artifact["scales"]]})
+                             args.teacher, args.output, args.teacher_kind, args.cache)
+        result = json.dumps({"output": args.output, "weights": [s["weights"] for s in artifact["scales"]],
+                             "ranks": [s.get("subspace", {}).get("rank", artifact["target_dim"])
+                                       for s in artifact["scales"]]})
+    elif args.command == "calibrate-cache":
+        from .calibration import calibrate_cached
+        from .feature_cache import FeatureCache
+        artifact = calibrate_cached(ExperimentConfig.load(args.config), FeatureCache(args.cache), args.output)
+        result = json.dumps({"output": args.output, "method": artifact["method"]})
+    elif args.command == "cache-features":
+        from .feature_cache import cache_features
+        result = cache_features(ExperimentConfig.load(args.config), args.manifest, args.student,
+                                args.teacher, args.output, args.teacher_kind)
     elif args.command in {"pretrain", "distill"}:
         result = train(ExperimentConfig.load(args.config), args.manifest, args.output,
                        modality=getattr(args, "modality", "ppg"),

@@ -134,6 +134,9 @@ class TrainConfig:
     precision: str = "fp32"
     device: str = "auto"
     threads: int = 4
+    transfer_method: str = "pw_kd"
+    checkpoint_selection: str = "reconstruction"
+    gradient_audit_interval: int = 0
 
 
 @dataclass
@@ -151,11 +154,27 @@ class CalibrationConfig:
 
 
 @dataclass
+class COSDConfig:
+    basis: str = "standardized"
+    selection: str = "topk_oof_skill"
+    rank: int = 64
+    min_skill: float = 0.0
+    stability: bool = True
+    bootstrap_samples: int = 200
+    confidence: float = 0.95
+    repeats: int = 1
+    basis_fraction: float = 0.2
+    audit_fraction: float = 0.2
+    soft: bool = False
+
+
+@dataclass
 class ExperimentConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     data: DataConfig = field(default_factory=DataConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
+    cosd: COSDConfig = field(default_factory=COSDConfig)
 
     def validate(self):
         d, t, c = self.data, self.train, self.calibration
@@ -196,6 +215,31 @@ class ExperimentConfig:
             raise ValueError("Loss weights must be nonnegative")
         if t.transfer_mode not in {"calibrated", "all", "quality", "random", "none"}:
             raise ValueError("Unknown transfer_mode")
+        if t.transfer_method not in {"none", "vanilla", "pw_kd", "cosd"}:
+            raise ValueError("Unknown transfer_method")
+        if t.transfer_method == "vanilla" and t.transfer_mode not in {"all", "quality"}:
+            raise ValueError("Vanilla KD uses transfer_mode all or quality, without OOF weights")
+        if t.checkpoint_selection not in {"reconstruction", "last"}:
+            raise ValueError("checkpoint_selection must be reconstruction or last")
+        if type(t.gradient_audit_interval) is not int or t.gradient_audit_interval < 0:
+            raise ValueError("gradient_audit_interval must be a nonnegative number of optimizer steps")
+        s = self.cosd
+        if s.basis not in {"standardized", "pca", "random"}:
+            raise ValueError("Unknown COSD basis")
+        if s.selection not in {"topk_oof_skill", "random", "variance", "all"}:
+            raise ValueError("Unknown COSD selection")
+        if type(s.rank) is not int or s.rank < 0 or type(s.repeats) is not int or s.repeats < 1:
+            raise ValueError("Invalid COSD rank/repeats")
+        if not 0 <= s.min_skill < 1 or not 0.5 < s.confidence < 1:
+            raise ValueError("Invalid COSD skill/confidence")
+        if type(s.bootstrap_samples) is not int or s.bootstrap_samples < 20:
+            raise ValueError("COSD bootstrap_samples must be >=20")
+        if not 0 < s.basis_fraction < 1 or not 0 < s.audit_fraction < 1 or s.basis_fraction + s.audit_fraction >= 1:
+            raise ValueError("COSD basis/audit fractions must leave discovery patients")
+        if type(s.soft) is not bool or type(s.stability) is not bool:
+            raise ValueError("COSD switches must be boolean")
+        if s.selection == "variance" and s.basis != "pca":
+            raise ValueError("Variance selection requires PCA basis")
         if t.precision not in {"fp32", "bf16", "fp16"}:
             raise ValueError("Unknown precision")
         if c.folds < 2 or c.ridge <= 0 or c.min_subjects_per_bin < 1:
@@ -215,7 +259,7 @@ class ExperimentConfig:
 
     @classmethod
     def from_dict(cls, values):
-        unknown = set(values) - {"model", "data", "train", "calibration"}
+        unknown = set(values) - {"model", "data", "train", "calibration", "cosd"}
         if unknown:
             raise ValueError(f"Unknown config sections: {unknown}")
         model = ModelConfig.from_dict(values["model"]) if "model" in values else ModelConfig()
@@ -231,6 +275,7 @@ class ExperimentConfig:
             data=data,
             train=TrainConfig(**values.get("train", {})),
             calibration=CalibrationConfig(**values.get("calibration", {})),
+            cosd=COSDConfig(**values.get("cosd", {})),
         ).validate()
 
     @classmethod

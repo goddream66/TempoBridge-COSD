@@ -226,9 +226,12 @@ def reconstruction_loss(model, waveform, mask, morphology_weight=0.25):
 class TransferHeads(nn.Module):
     def __init__(self, dim, target_dim, scales):
         super().__init__()
+        dimensions = [target_dim] * len(scales) if isinstance(target_dim, int) else list(target_dim)
+        if len(dimensions) != len(scales) or any(d < 0 for d in dimensions):
+            raise ValueError("One nonnegative target dimension is required per scale")
         self.heads = nn.ModuleList([
             nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, dim), nn.GELU(),
-                          nn.Linear(dim, target_dim)) for _ in scales
+                          nn.Linear(dim, d)) if d else nn.Identity() for d in dimensions
         ])
 
     def forward(self, tokens, scale_index):

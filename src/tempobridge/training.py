@@ -9,7 +9,6 @@ from dataclasses import asdict
 from pathlib import Path
 
 import torch
-from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
 from .calibration import CalibrationWeights
@@ -18,6 +17,7 @@ from .data import PairedDataset, manifest_digest, read_manifest, split_size, sub
 from .model import TempoBridge, TransferHeads, random_mask, reconstruction_loss
 from .sampling import SourceBlockSampler
 from .teacher import FrozenTeacher
+from .transfer import distillation_loss, gradient_audit
 from .utils import (
     device_for,
     environment,
@@ -42,23 +42,15 @@ def autocast_context(config, device):
 
 def transfer_loss(model, heads, teacher, calibrator, ppg, ecg, valid,
                   ppg_quality, ecg_quality, scale_index, mode, protect_shallow):
-    weights = calibrator.lookup(scale_index, ppg_quality, ecg_quality, valid, mode)
-    selected = weights > 0
-    if not selected.any():
-        # No optimizer updates to transfer-only heads from absent supervision.
-        return ppg.new_zeros(()), weights.mean()
-    with torch.no_grad():
-        target = calibrator.normalize(teacher(ecg[selected]), scale_index).detach()
-    features = model.transfer_features(ppg[selected], detach_shallow=protect_shallow)
-    pred = heads(features, scale_index).float()
-    error = F.smooth_l1_loss(pred, target.float(), reduction="none").mean(-1)
-    # Fixed denominator: small calibrated weights must actually reduce supervision.
-    loss = (weights[selected] * error).sum() / len(ppg)
-    return loss, weights.mean()
+    """Compatibility wrapper for the historical loss API."""
+    loss, metrics = distillation_loss(model, heads, teacher, calibrator, ppg, ecg, valid,
+                                     ppg_quality, ecg_quality, scale_index, mode, protect_shallow)
+    return loss, ppg.new_tensor(metrics["mean_transfer_weight"])
 
 
-def batch_loss(config, model, batch, device, modality, heads=None, teacher=None, calibrator=None):
-    ssl, kd, coverage = [], [], []
+def batch_loss(config, model, batch, device, modality, heads=None, teacher=None, calibrator=None,
+               audit_gradients=False):
+    ssl, kd, transfer_metrics = [], [], []
     if modality == "ecg":
         keep = batch["ecg_valid"]
     else:
@@ -67,8 +59,8 @@ def batch_loss(config, model, batch, device, modality, heads=None, teacher=None,
         wave = batch[modality][index][keep].to(device)
         mask = random_mask(wave, model.config.patch_size, config.train.mask_ratio)
         ssl.append(reconstruction_loss(model, wave, mask, config.train.morphology_loss_weight))
-        if heads is not None and config.train.transfer_mode != "none":
-            loss, active = transfer_loss(
+        if heads is not None and config.train.transfer_mode != "none" and config.train.transfer_method != "none":
+            loss, terms = distillation_loss(
                 model, heads, teacher, calibrator,
                 batch["ppg"][index].to(device), batch["ecg"][index].to(device),
                 batch["ecg_valid"].to(device), batch["ppg_quality"].to(device),
@@ -76,13 +68,18 @@ def batch_loss(config, model, batch, device, modality, heads=None, teacher=None,
                 config.train.transfer_mode, config.train.protect_shallow,
             )
             kd.append(loss)
-            coverage.append(active)
+            transfer_metrics.append(terms)
     self_loss = torch.stack(ssl).mean()
     distillation = torch.stack(kd).mean() if kd else self_loss.new_zeros(())
-    weight = torch.stack(coverage).mean() if coverage else self_loss.new_zeros(())
     total = self_loss + config.train.transfer_weight * distillation
+    names = ("mean_transfer_weight", "paired_fraction", "active_transfer_fraction", "target_rank")
+    metrics = {name: sum(m[name] for m in transfer_metrics) / len(transfer_metrics)
+               if transfer_metrics else 0. for name in names}
+    metrics["paired_fraction"] = float(batch["ecg_valid"][keep].float().mean())
+    if audit_gradients:
+        metrics.update(gradient_audit(self_loss, distillation, model, config.train.transfer_weight))
     return total, {"ssl": float(self_loss.detach()), "transfer": float(distillation.detach()),
-                   "mean_transfer_weight": float(weight.detach())}
+                   **metrics}
 
 
 @torch.inference_mode()
@@ -121,8 +118,12 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
         raise FileExistsError("Run already has last.pt; use --resume or another output directory")
     output.mkdir(parents=True, exist_ok=True)
     stage = "distill" if teacher_path else "pretrain"
-    if stage == "distill" and (modality != "ppg" or not student_path or not calibration_path):
-        raise ValueError("Distillation requires PPG warm-up and calibration artifact")
+    if stage == "distill" and (modality != "ppg" or not student_path):
+        raise ValueError("Distillation requires PPG warm-up")
+    if stage == "distill" and config.train.transfer_method == "none":
+        raise ValueError("SSL-only continuation should not load a teacher")
+    if stage == "distill" and not calibration_path and config.train.transfer_method != "vanilla":
+        raise ValueError("PW-KD/COSD requires a calibration artifact")
     model = TempoBridge(config.model).to(device)
     teacher, calibrator, heads = None, None, None
     provenance = {"student_sha256": None, "teacher_sha256": None, "calibration_sha256": None,
@@ -140,11 +141,16 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
         model.load_state_dict(initial["model"])
         provenance["student_sha256"] = file_sha256(student_path)
     if teacher_path:
+        if calibration_path is None:
+            from .calibration import calibrate
+            calibration_path = output / "target_statistics.json"
+            if not calibration_path.exists():
+                calibrate(config, manifest, student_path, teacher_path, calibration_path, teacher_kind)
         teacher = FrozenTeacher(teacher_path, teacher_kind).to(device)
         teacher.verify_data(records, config.data.ecg_fs)
         calibrator = CalibrationWeights.load(calibration_path).to(device)
         calibrator.validate(config, digest, teacher.fingerprint, provenance["student_sha256"], teacher_kind)
-        heads = TransferHeads(config.model.dim, calibrator.artifact["target_dim"], config.data.scales_seconds).to(device)
+        heads = TransferHeads(config.model.dim, calibrator.output_dims, config.data.scales_seconds).to(device)
         provenance.update(teacher_sha256=teacher.fingerprint,
                           calibration_sha256=file_sha256(calibration_path))
         if config.train.transfer_mode == "calibrated" and not (calibrator.weights > 0).any():
@@ -207,7 +213,8 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
         model.train()
         if heads:
             heads.train()
-        metrics, examples = {"loss": 0.0, "ssl": 0.0, "transfer": 0.0, "mean_transfer_weight": 0.0}, 0
+        metrics, examples = {name: 0. for name in ("loss", "ssl", "transfer", "mean_transfer_weight",
+                                                  "paired_fraction", "active_transfer_fraction", "target_rank")}, 0
         iterator = iter(loader)
         while group := list(itertools.islice(iterator, config.train.accumulation)):
             counts = [int(b["ecg_valid"].sum()) if modality == "ecg" else len(b["ecg_valid"]) for b in group]
@@ -218,13 +225,16 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
                 if batch_count == 0:
                     continue
                 with autocast_context(config, device):
-                    loss, terms = batch_loss(config, model, batch, device, modality, heads, teacher, calibrator)
+                    audit_gradients = (config.train.gradient_audit_interval > 0 and
+                                       global_step % config.train.gradient_audit_interval == 0)
+                    loss, terms = batch_loss(config, model, batch, device, modality, heads, teacher,
+                                             calibrator, audit_gradients=audit_gradients)
                 if not torch.isfinite(loss):
                     raise FloatingPointError("Nonfinite training loss")
                 scaler.scale(loss * batch_count / sum(counts)).backward()
                 metrics["loss"] += float(loss.detach()) * batch_count
                 for key, value in terms.items():
-                    metrics[key] += value * batch_count
+                        metrics[key] = metrics.get(key, 0.) + value * batch_count
                 examples += batch_count
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(parameters, config.train.grad_clip, error_if_nonfinite=True)
@@ -235,9 +245,9 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
         if not examples:
             raise ValueError("No usable training examples for selected modality")
         val = evaluate_reconstruction(config, model, records, device, modality)
-        improved = val is not None and val < best
+        improved = config.train.checkpoint_selection == "last" or (val is not None and val < best)
         if improved:
-            best = val
+            best = val if val is not None else best
         state = {
             "format_version": 1, "model": model.state_dict(), "model_config": model.model_config(),
             "heads": heads.state_dict() if heads else None, "config": config.to_dict(),
@@ -255,6 +265,12 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
         row = {"epoch": epoch + 1, "global_step": global_step, **{k: v / examples for k, v in metrics.items()},
                "val_reconstruction": val, "lr": optimizer.param_groups[0]["lr"],
                "seconds": time.monotonic() - started, "examples": examples}
+        for key in ("ssl_gradient_norm", "kd_gradient_norm", "gradient_cosine"):
+            if key in metrics:
+                row[key] = metrics[key] / max(metrics["gradient_audit_fraction"], 1.)
+        row["paired_windows"] = metrics["paired_fraction"]
+        row["active_transfer_windows"] = metrics["active_transfer_fraction"]
+        row["transfer_weight_sum"] = metrics["mean_transfer_weight"]
         with (output / "metrics.jsonl").open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, allow_nan=False) + "\n")
         print(json.dumps(row), flush=True)

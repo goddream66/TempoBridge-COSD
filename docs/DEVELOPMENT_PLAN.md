@@ -44,7 +44,19 @@ No real-data training or GPU training is authorized for this development task; v
   regeneration), explicit teacher feature metadata, real HDF5 record/time metadata and unknown flags.
 - CPU checks: 67 targeted tests passed; Ruff passed. Initial pytest attempt failed to create
   sandbox temporary directories; rerun used an explicit workspace basetemp and passed.
-- Iteration 2 next. Remaining iterations remain required before completion.
+- Iteration 2 implemented: mmap feature cache, schema-3 calibration, patient-disjoint
+  basis/discovery/audit, conditional cluster bootstrap, hard/soft selection and rank-zero fallback.
+- Iteration 3 core implemented: projected targets, vanilla statistics without probes,
+  shared-warm-up SSL continuation, fixed-budget checkpoint selection, gradient diagnostics,
+  full/PCA/random/soft configurations and real CLI smoke runner.
+- CPU full suite: 218 passed (14 existing dependency deprecation warnings); Ruff passed.
+- Five-method 30-second synthetic CLI verification is in `runs/cosd_validation/core_cli_20261107`.
+  `summary.json` confirms completion, including a nonzero COSD rank of 4 and finite KD gradients.
+  This is not physiological efficacy evidence. A subsequent paired-count logging correction passed
+  all 15 COSD training/gradient/resume/export tests; Ruff and `git diff --check` passed.
+- Still required: dataset-level pairing/time-shift controls; patient-aware sampling; quality/reference
+  target pipeline; downstream evaluation and ablation runner; final organization/CI/package/rename audit.
+  The directory remains `TempoBridge_backbone` until the final relocation checks.
 
 ## Organization references
 

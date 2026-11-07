@@ -11,14 +11,10 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, Subset
 
-from .config import DataConfig, ModelConfig
-from .data import PairedDataset, manifest_digest, read_manifest, subject_ids
-from .model import TempoBridge
-from .sampling import calibration_indices
+from .data import manifest_digest, read_manifest
 from .teacher import FrozenTeacher
-from .utils import device_for, file_sha256, load_checkpoint, seed_all, write_json
+from .utils import file_sha256, seed_all, write_json
 
 
 def subject_weights(subjects):
@@ -120,67 +116,69 @@ def crossfit_scale(features, targets, subjects, quality, config, edges, seed=42)
             "target_mean": mean.tolist(), "target_scale": scale.tolist()}
 
 
-def calibrate(config, manifest, student_path, teacher_path, output, teacher_kind="native"):
+def calibrate(config, manifest, student_path, teacher_path, output, teacher_kind="native", cache_path=None):
+    """Build or verify a reusable frozen-feature cache, then fit calibration only."""
+    from .feature_cache import FeatureCache, cache_features
+
     if Path(output).exists():
         raise FileExistsError("Calibration output exists; choose a new artifact path")
-    seed_all(config.train.seed, config.train.threads)
-    config.validate()
+    if cache_path is None:
+        cache_path = Path(output).with_name(Path(output).stem + "_features")
+        cache_features(config, manifest, student_path, teacher_path, cache_path, teacher_kind)
+    cache = FeatureCache(cache_path)
     records = read_manifest(manifest, data_config=config.data)
-    digest = manifest_digest(records)
-    checkpoint = load_checkpoint(student_path)
-    if checkpoint.get("modality") != "ppg" or checkpoint.get("global_step", 0) < 1:
-        raise ValueError("Calibration requires a trained PPG warm-up checkpoint")
-    if checkpoint["manifest_sha256"] != digest:
-        raise ValueError("Student warm-up and calibration manifest differ")
-    if asdict(ModelConfig.from_dict(checkpoint["model_config"])) != config.to_dict()["model"]:
-        raise ValueError("Student architecture differs from config")
-    if DataConfig.from_dict(checkpoint["config"]["data"]).input_protocol() != config.data.input_protocol():
-        raise ValueError("Student warm-up input protocol differs from config; warm up again")
-    device = device_for(config.train.device)
-    model = TempoBridge(ModelConfig.from_dict(checkpoint["model_config"])).to(device)
-    model.load_state_dict(checkpoint["model"])
-    model.eval().requires_grad_(False)
-    teacher = FrozenTeacher(teacher_path, teacher_kind).to(device)
+    teacher = FrozenTeacher(teacher_path, teacher_kind)
     teacher.verify_data(records, config.data.ecg_fs)
-    dataset = PairedDataset(records, config.data, augment=False)
-    indices = calibration_indices(dataset.records, config.calibration.max_windows_per_subject,
-                                  config.train.seed)
-    loader = DataLoader(Subset(dataset, indices), batch_size=config.train.batch_size, shuffle=False,
-                        num_workers=config.data.workers)
-    features, targets = [[] for _ in config.data.scales_seconds], [[] for _ in config.data.scales_seconds]
-    subjects, qualities = [], []
-    with torch.inference_mode():
-        for batch in loader:
-            valid = (batch["subject_known"] & batch["ecg_valid"] &
-                     (batch["ecg_quality"] >= config.calibration.min_ecg_quality))
-            if not valid.any():
-                continue
-            subjects.extend(np.asarray(batch["subject_id"])[valid.numpy()].tolist())
-            qualities.extend(batch["ppg_quality"][valid].tolist())
-            for s in range(len(features)):
-                x, e = batch["ppg"][s][valid].to(device), batch["ecg"][s][valid].to(device)
-                features[s].append(model.transfer_features(x).cpu().numpy())
-                targets[s].append(teacher(e).cpu().numpy())
-    dataset.close()
-    if not subjects:
-        raise ValueError("No reliable paired ECG for calibration")
-    reports = [crossfit_scale(np.concatenate(x), np.concatenate(y), subjects, qualities,
-                             config.calibration, config.data.quality_edges, config.train.seed)
-               for x, y in zip(features, targets)]
+    cache.validate(config, manifest_digest(records), teacher.fingerprint,
+                   file_sha256(student_path), teacher_kind)
+    return calibrate_cached(config, cache, output)
+
+
+def calibrate_cached(config, cache, output):
+    """No encoder forward or waveform access; all transformations use train patients."""
+    from .subspace import fit_subspace, partition_patients, patient_moments
+
+    if Path(output).exists():
+        raise FileExistsError("Calibration output exists; choose a new artifact path")
+    config.validate()
+    seed_all(config.train.seed, config.train.threads)
+    a = cache.artifact
+    cache.validate(config, a["manifest_sha256"], a["teacher_sha256"],
+                   a["student_sha256"], a["teacher_kind"])
+    subjects, qualities = cache.column("subject_id"), cache.column("ppg_quality")
+    sources = cache.column("source")
+    method = config.train.transfer_method
+    if method == "none":
+        raise ValueError("SSL-only training does not require calibration")
+    partitions = (partition_patients(subjects, config.cosd, config.train.seed)
+                  if len(np.unique(subjects)) >= 3 else None)
+    normalizers = np.isin(subjects, partitions["basis"]) if partitions else np.ones(len(subjects), bool)
+    reports = []
+    for scale in range(len(config.data.scales_seconds)):
+        x, y = cache.arrays(scale)
+        if method == "pw_kd" or config.train.transfer_mode in {"calibrated", "random"}:
+            report = crossfit_scale(x, y, subjects, qualities, config.calibration,
+                                    config.data.quality_edges, config.train.seed)
+        else:
+            report = {"weights": [1.] * (len(config.data.quality_edges) + 1), "bins": [], "folds": []}
+        # Same final target scaling for full and projected targets when using the same cache/config.
+        mean, variance = patient_moments(y[normalizers], subjects[normalizers])
+        report.update(target_mean=mean.tolist(), target_scale=np.sqrt(variance).clip(1e-4).tolist())
+        if method == "cosd":
+            report["subspace"] = fit_subspace(x, y, subjects, sources, config.calibration,
+                                               config.cosd, config.train.seed)
+        reports.append(report)
     result = {
-        "schema_version": 2, "student_sha256": file_sha256(student_path),
-        "feature_spec": model.transfer_feature_spec(), "teacher_feature_spec": teacher.feature_spec,
-        "teacher_sha256": teacher.fingerprint, "teacher_kind": teacher_kind,
-        "manifest_sha256": digest, "train_subjects": sorted(subject_ids(records, "train")),
-        "selection": {"seed": config.train.seed, "candidates": len(indices),
-                      "reliable_pairs": len(subjects), "unknown_ids_excluded": True,
-                      "max_windows_per_subject": config.calibration.max_windows_per_subject},
-        "scales_seconds": config.data.scales_seconds, "ppg_fs": config.data.ppg_fs,
-        "window_mode": config.data.window_mode,
-        "ecg_fs": config.data.ecg_fs, "quality_edges": config.data.quality_edges,
-        "calibration_config": config.to_dict()["calibration"],
-        "target_dim": len(reports[0]["target_mean"]), "scales": reports,
-        "scope": "out-of-fold probes on a fixed train-patient-pretrained representation",
+        "schema_version": 3, "method": method, "student_sha256": a["student_sha256"],
+        "teacher_sha256": a["teacher_sha256"], "teacher_kind": a["teacher_kind"],
+        "manifest_sha256": a["manifest_sha256"], "train_subjects": a["train_subjects"],
+        "feature_spec": a["feature_spec"], "teacher_feature_spec": a["teacher_feature_spec"],
+        "selection": a["selection"], "cache_sha256": cache.fingerprint,
+        **config.data.input_protocol(), "quality_edges": config.data.quality_edges,
+        "calibration_config": asdict(config.calibration), "cosd_config": asdict(config.cosd),
+        "normalization_subjects": sorted(np.unique(subjects[normalizers]).tolist()),
+        "target_dim": a["target_dim"], "scales": reports,
+        "scope": "OOF probes on fixed pretrained representations; COSD audit is independent of direction selection",
     }
     write_json(output, result)
     return result
@@ -194,6 +192,12 @@ class CalibrationWeights(nn.Module):
         self.register_buffer("weights", torch.tensor([s["weights"] for s in artifact["scales"]]))
         self.register_buffer("mean", torch.tensor([s["target_mean"] for s in artifact["scales"]]))
         self.register_buffer("scale", torch.tensor([s["target_scale"] for s in artifact["scales"]]))
+        from .subspace import TeacherSubspace
+        self.transforms = nn.ModuleList([
+            TeacherSubspace(s["subspace"]) if "subspace" in s else nn.Identity()
+            for s in artifact["scales"]])
+        self.output_dims = [s["subspace"]["rank"] if "subspace" in s else len(s["target_mean"])
+                            for s in artifact["scales"]]
 
     @classmethod
     def load(cls, path):
@@ -201,7 +205,7 @@ class CalibrationWeights(nn.Module):
 
     def validate(self, config, manifest_hash, teacher_hash, student_hash, teacher_kind):
         a = self.artifact
-        if a.get("schema_version") not in {1, 2}:
+        if a.get("schema_version") not in {1, 2, 3}:
             raise ValueError("Unsupported calibration schema")
         expected = {"manifest_sha256": manifest_hash, "teacher_sha256": teacher_hash,
                     "student_sha256": student_hash, "teacher_kind": teacher_kind,
@@ -215,10 +219,20 @@ class CalibrationWeights(nn.Module):
                 raise ValueError(f"Stale/incompatible calibration: {key}")
         if a["schema_version"] == 1:
             raise ValueError("Legacy calibration used a different feature contract; recalibrate")
+        if a["schema_version"] == 2 and config.train.transfer_method == "cosd":
+            raise ValueError("COSD requires a schema v3 projected-target artifact")
         expected_spec = {"version": 1, "layer": config.model.depth - 1,
                          "pool": "context_mean", "dim": config.model.dim}
         if a.get("feature_spec") != expected_spec:
             raise ValueError("Stale/incompatible calibration: feature_spec")
+        if a["schema_version"] == 3:
+            for key, expected_value in {"method": config.train.transfer_method,
+                                        "cosd_config": asdict(config.cosd),
+                                        "calibration_config": asdict(config.calibration)}.items():
+                if a.get(key) != expected_value:
+                    raise ValueError(f"Stale/incompatible calibration: {key}")
+            if config.train.transfer_method == "cosd" and any("subspace" not in s for s in a["scales"]):
+                raise ValueError("COSD artifact is missing a subspace")
         if self.weights.shape != (len(config.data.scales_seconds), len(config.data.quality_edges) + 1):
             raise ValueError("Invalid calibration weight shape")
         if self.mean.shape != (len(config.data.scales_seconds), a["target_dim"]) or self.scale.shape != self.mean.shape:
@@ -241,4 +255,11 @@ class CalibrationWeights(nn.Module):
         return (base * reliability * valid.float()).detach()
 
     def normalize(self, target, scale_index):
+        if "subspace" in self.artifact["scales"][scale_index]:
+            return self.transforms[scale_index](target)
         return (target.float() - self.mean[scale_index]) / self.scale[scale_index]
+
+    def direction_weights(self, scale_index):
+        if "subspace" in self.artifact["scales"][scale_index]:
+            return self.transforms[scale_index].weights
+        return torch.ones(self.output_dims[scale_index], device=self.mean.device)
