@@ -58,6 +58,11 @@ direct physiological supervision, frozen probes and full downstream fine-tuning.
 
 ## Portable use
 
+The local project folder is now `TempoBridge-COSD`. Reopen that folder in your editor;
+the Python distribution/import name is still `tempobridge`. Development version
+`0.4.0.dev1` includes the COSD and downstream pipelines. The local Windows environment
+was rebound to its new directory; on another machine install a fresh environment.
+
 Use `python -m tempobridge` in the active environment. Paths are supplied through CLI/config
 or resolved relative to manifests; generated caches are portable directories. Virtual environments
 are local installations, not distribution artifacts, and should be recreated on another machine.

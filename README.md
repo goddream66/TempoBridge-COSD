@@ -56,7 +56,7 @@ Python >= 3.10，PyTorch >= 2.4。请先按硬件安装 PyTorch，再安装项�
 本地使用独立 `.venv`；不会改动原有 Python 环境。
 
 ```powershell
-cd TempoBridge_backbone
+cd TempoBridge-COSD
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 .\.venv\Scripts\python.exe -m pip install -e ".[dev,data]"

@@ -16,9 +16,13 @@ def main():
     parser.add_argument("--wheel", required=True)
     parser.add_argument("--encoder", required=True)
     parser.add_argument("--output", default="runs/portability.json")
+    parser.add_argument("--temp-root", help="Optional writable parent for the disposable relocation check")
     args = parser.parse_args()
     wheel, encoder = Path(args.wheel).resolve(), Path(args.encoder).resolve()
-    with tempfile.TemporaryDirectory(prefix="tempobridge_portable_") as directory:
+    temp_root = Path(args.temp_root).resolve() if args.temp_root else None
+    if temp_root:
+        temp_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="tempobridge_portable_", dir=temp_root) as directory:
         root = Path(directory)
         with zipfile.ZipFile(wheel) as archive:
             for name in archive.namelist():

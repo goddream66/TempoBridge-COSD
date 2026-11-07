@@ -69,9 +69,16 @@ No real-data training or GPU training is authorized for this development task; v
   `runs/cosd_validation/downstream_cli_20261107/summary.json`. These are synthetic fixtures only.
 - Follow-up resume-metadata and paired-support validation changes: 29 targeted checks passed;
   all 19 experiment configurations load; Ruff and `git diff --check` passed.
+- Directory migration completed to `D:/TempoBridge-COSD` after the user closed the
+  occupying VS Code project. The local editable installation and Windows Python
+  command launchers were repaired; package imports now resolve to the new source.
+  Development package version is `0.4.0.dev1`; Python import name remains `tempobridge`.
+  Wheel build, independent-directory wheel/encoder loading and `pip check` passed.
+- Post-relocation full suite: 251 passed, 14 dependency warnings, 81.32 seconds;
+  relocated wheel import and encoder loading passed again. Old project directory
+  no longer exists; runtime artifacts/environments remain excluded from Git.
 - Still required: representation/source/quality audit commands; complete experiment matrix and
-  matched-budget/rank/weight orchestration; final organization/CI/package/rename audit.
-  The directory remains `TempoBridge_backbone` until the final relocation checks.
+  matched-budget/rank/weight orchestration; final method/docs organization and requirement audit.
 
 ## Organization references
 
