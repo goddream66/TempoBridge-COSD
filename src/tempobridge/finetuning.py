@@ -12,7 +12,13 @@ from torch.utils.data import DataLoader, Dataset
 
 from .calibration import subject_weights
 from .data import PairedDataset, manifest_digest, read_manifest
-from .evaluation import cluster_intervals, select_label_groups, task_metrics, validate_splits
+from .evaluation import (
+    cluster_intervals,
+    select_label_groups,
+    stratified_metrics,
+    task_metrics,
+    validate_splits,
+)
 from .inference import load_encoder
 from .model import TempoBridge
 from .physio_targets import TargetTable
@@ -32,7 +38,8 @@ class LabeledPPG(Dataset):
 
 
 def fine_tune(config, manifest, labels, target, output, encoder_path=None, task="regression",
-              label_fraction=1., bootstrap_samples=200, protocol="group_disjoint", target_source=None):
+              label_fraction=1., bootstrap_samples=200, protocol="group_disjoint", target_source=None,
+              test_manifest=None):
     config.validate()
     if config.data.window_mode != "full":
         raise ValueError("Downstream window labels require full input windows")
@@ -59,14 +66,21 @@ def fine_tune(config, manifest, labels, target, output, encoder_path=None, task=
         model = TempoBridge(config.model).to(device)
         model.reconstruction = model.morph_reconstruction = torch.nn.Identity()
     records, table = read_manifest(manifest, data_config=config.data), TargetTable(labels)
+    test_records = (read_manifest(test_manifest, require_train=False, data_config=config.data)
+                    if test_manifest else records)
     digest = manifest_digest(records)
+    test_digest = manifest_digest(test_records)
     datasets, parts, prepared = {}, {}, {}
     for split in ("train", "val", "test"):
-        dataset = PairedDataset(records, config.data, split=split, augment=False, include_ecg=False)
+        dataset = PairedDataset(test_records if split == "test" else records, config.data,
+                                split=split, augment=False, include_ecg=False)
         datasets[split] = dataset
         rows = [dataset.metadata(i) for i in range(len(dataset))]
         part = {k: np.asarray([row[k] for row in rows]) for k in
-                ("sample_id", "subject_id", "subject_known", "source", "identity_level")}
+                ("sample_id", "subject_id", "subject_known", "source", "identity_level", "ppg_quality",
+                 "ecg_quality", "ecg_available", "case_id", "recording_id")}
+        for key in ("ppg_quality_source", "ecg_quality_source", "timestamp_alignment_status", "device_id"):
+            part[key] = np.asarray([row[key] for row in rows])
         part.update(embedding=np.zeros((len(rows), 1)), scale_seconds=config.data.scales_seconds[0],
                     metadata={"split": split, "encoder_sha256": file_sha256(encoder_path) if encoder_path else "random_init",
                               "pretraining": provenance})
@@ -158,7 +172,7 @@ def fine_tune(config, manifest, labels, target, output, encoder_path=None, task=
                 "head": head.state_dict(), "config": config.to_dict(), "task": task, "target": target,
                 "classes": classes, "target_mean": mean, "target_scale": scale, "epoch": epoch + 1,
                 "selected_training_groups": groups, "labels_sha256": table.fingerprint,
-                "manifest_sha256": digest, "pretraining": provenance})
+                "manifest_sha256": digest, "test_manifest_sha256": test_digest, "pretraining": provenance})
     selected = load_checkpoint(output / "best.pt")
     model.load_state_dict(selected["model"])
     head.load_state_dict(selected["head"])
@@ -167,10 +181,12 @@ def fine_tune(config, manifest, labels, target, output, encoder_path=None, task=
         "initialization": "pretrained" if encoder_path else "random", "label_fraction": label_fraction,
         "seed": config.train.seed, "selected_training_groups": groups, "selected_epoch": selected["epoch"],
         "history": history, "audit": audit, "test": task_metrics(test["y"], prediction, test["subject_id"], task),
+        "strata": stratified_metrics(test, prediction, task, config.data.quality_edges),
         "by_source": {s: task_metrics(test["y"][test["source"] == s], prediction[test["source"] == s],
                                       test["subject_id"][test["source"] == s], task) for s in sorted(set(test["source"]))},
         "bootstrap": cluster_intervals(test["y"], prediction, test["subject_id"], task, bootstrap_samples, config.train.seed),
         "provenance": {"labels_sha256": table.fingerprint, "manifest_sha256": digest,
+                       "test_manifest_sha256": test_digest,
                        "encoder_sha256": file_sha256(encoder_path) if encoder_path else None}}
     np.savez(output / "predictions.npz", prediction=prediction, y=test["y"], sample_id=test["sample_id"],
              subject_id=test["subject_id"], source=test["source"], task=task, target=target, classes=np.asarray(classes))

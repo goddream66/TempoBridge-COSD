@@ -127,3 +127,38 @@ class PairingControlDataset(Dataset):
 
     def close(self):
         self.dataset.close()
+
+
+class WindowSubsetDataset(Dataset):
+    """Explicit paired/unpaired ablation using actual waveform validity.
+
+    Indexing reads each training waveform once; metadata presence alone cannot
+    certify that an ECG is usable. Original manifest identities remain unchanged.
+    """
+    def __init__(self, dataset, subset):
+        if subset not in {"paired", "unpaired"}:
+            raise ValueError("Subset must be paired or unpaired")
+        self.dataset, self.config, self.subset = dataset, dataset.config, subset
+        self.indices = [i for i in range(len(dataset)) if bool(dataset[i]["ecg_valid"]) == (subset == "paired")]
+        if not self.indices:
+            raise ValueError(f"No valid windows in {subset} subset")
+        self.records = [dataset.records[i] for i in self.indices]
+
+    def __len__(self):
+        return len(self.indices)
+
+    def metadata(self, index):
+        return self.dataset.metadata(self.indices[index])
+
+    def __getitem__(self, index):
+        return self.dataset[self.indices[index]]
+
+    def set_epoch(self, epoch):
+        self.dataset.set_epoch(epoch)
+
+    def report(self):
+        return {"subset": self.subset, "windows": len(self), "original_windows": len(self.dataset),
+                "sample_ids": [r.sample_id for r in self.records], "selection": "actual ECG waveform validity"}
+
+    def close(self):
+        self.dataset.close()

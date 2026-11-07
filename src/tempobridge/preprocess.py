@@ -299,7 +299,7 @@ def preprocess_raw(kind, root, output, config=None, source=None, id_map=None, re
     companions = [(p.relative_to(root).as_posix(), p.stat().st_size, p.stat().st_mtime_ns)
                   for p in sorted(root.rglob("*.dat"))] if kind == "mimic" else []
     contract_data = {"kind": kind, "source": source, "config": asdict(config),
-                     "converter_version": 2, "quality_diagnostics": DIAGNOSTIC_VERSION,
+                     "converter_version": 3, "quality_diagnostics": DIAGNOSTIC_VERSION,
                      "records": inventory, "companions": companions, "id_map": identities}
     contract = canonical_hash(contract_data)
     contract_path = output / "conversion_contract.json"
@@ -352,6 +352,7 @@ def preprocess_raw(kind, root, output, config=None, source=None, id_map=None, re
                         continue
                     sample.update(subject_id=np.int64(subject), case_id=np.int64(case),
                                   record_key=relative, window_start_s=window * config.window_seconds,
+                                  timestamp_alignment_status="shared_grid_unverified_interchannel_delay",
                                   raw_fs=float(fs), dataset_id=np.int64(0 if kind == "mimic" else 1))
                     try:
                         writer.add(sample, (number, window))

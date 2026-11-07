@@ -1,5 +1,23 @@
 # 验证记录
 
+## 2026-11-07 0.4.0 最终工程验证
+
+- 完整 CPU pytest：**277 passed，14 warnings，113.75 秒**。警告来自既有 TorchScript 与 WFDB/pandas 弃用接口。
+- 覆盖实际逐尺度 rank、共享 warm-up/训练预算、来源隔离、完整下游微调、教师层/池化/随机负对照、
+  每层梯度/更新、文件变化拒绝复用、失败阶段保留、质量元数据和确定性噪声。
+- Ruff、`git diff --check`、19 个配置加载与 `pip check` 通过。
+- 实际 CLI 测试：SSL/PW-KD/COSD/COSD+PW/随机/PCA/随机教师 7 种路径，共用匹配预算；
+  再执行时全部核对并复用已完成产物。证据：`runs/cosd_validation/matrix_release_20261107/summary.json`。
+  此 smoke 的 selection=all 是为覆盖非零 rank 路径，不是 OOF 选择有效性的实验。
+- CPU benchmark 成功测量 PPG 推理、教师前向、参数量与 profiler 可计数 FLOPs；这些是小型合成配置数据，
+  不代表正式 backbone 的吞吐或大规模 GPU-hours。记录：`runs/cosd_validation/matrix_cli_20261107/benchmark.json`。
+- `tempobridge-0.4.0-py3-none-any.whl` 成功构建；独立目录优先导入 wheel 内容并相对路径加载 encoder，
+  CPU 特征 `[2,32]` 且有限。记录：`runs/cosd_validation/release_portability_20261107.json`。
+- 研究方案原文未修改；环境、数据、模型权重和运行产物均未跟踪进 Git。
+
+全部为 CPU 合成验证；没有真实数据训练、GPU 训练或临床效果结论。
+已更新托管 CI 的配置，但没有把本地通过表述为已在托管服务执行。
+
 ## 2026-11-07 COSD、参考监督与下游评估
 
 - 完整 CPU suite：251 passed，14 条已有依赖弃用警告，79.03 秒。

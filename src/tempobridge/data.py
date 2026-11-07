@@ -37,6 +37,8 @@ class Record:
     case_id: str = ""
     ppg_quality_source: str = "manifest"
     ecg_quality_source: str = "manifest"
+    timestamp_alignment_status: str = "unknown"
+    device_id: str = ""
 
 
 def read_manifest(path, check_files=True, require_train=True, data_config=None):
@@ -87,7 +89,9 @@ def read_manifest(path, check_files=True, require_train=True, data_config=None):
                                   source=row.get("source") or "default",
                                   window_start_s=window_start, case_id=row.get("case_id") or "",
                                   ppg_quality_source="manifest" if row.get("ppg_quality") else "unknown",
-                                  ecg_quality_source="manifest" if row.get("ecg_quality") else "unknown"))
+                                  ecg_quality_source="manifest" if row.get("ecg_quality") else "unknown",
+                                  timestamp_alignment_status=row.get("timestamp_alignment_status") or "unknown",
+                                  device_id=row.get("device_id") or ""))
     if not records or (require_train and not any(r.split == "train" for r in records)):
         raise ValueError("Manifest needs nonempty train split")
     return records
@@ -105,6 +109,10 @@ def manifest_digest(records):
                  r.ppg_quality_source, r.ecg_quality_source]
         if extra != ["default", -1.0, "", "manifest", "manifest"]:
             digest.update(json.dumps(extra).encode())
+        if r.timestamp_alignment_status != "unknown":
+            digest.update(json.dumps({"timestamp_alignment_status": r.timestamp_alignment_status}).encode())
+        if r.device_id:
+            digest.update(json.dumps({"device_id": r.device_id}).encode())
         with r.path.open("rb") as handle:
             while chunk := handle.read(1024 * 1024):
                 digest.update(chunk)
@@ -180,6 +188,10 @@ class PairedDataset(Dataset):
                "subject_known": record.subject_known, "source": record.source,
                "recording_id": record.recording_id, "recording_known": record.recording_known,
                "window_start_s": record.window_start_s, "ppg_quality": record.ppg_quality,
+               "ecg_quality": record.ecg_quality, "case_id": record.case_id,
+               "ppg_quality_source": record.ppg_quality_source, "ecg_quality_source": record.ecg_quality_source,
+               "timestamp_alignment_status": record.timestamp_alignment_status,
+               "device_id": record.device_id,
                "identity_level": "subject_id" if record.subject_known else "unknown"}
         if record.h5_row is not None:
             row.update(self.h5_reader.metadata(record))
@@ -195,6 +207,8 @@ class PairedDataset(Dataset):
                     "window_start_s": record.window_start_s, "case_id": record.case_id,
                     "ppg_quality_source": record.ppg_quality_source,
                     "ecg_quality_source": record.ecg_quality_source,
+                    "timestamp_alignment_status": record.timestamp_alignment_status,
+                    "device_id": record.device_id,
                     "identity_level": "subject_id" if record.subject_known else "unknown"}
         if record.h5_row is not None:
             data, pq, eq = self.h5_reader.read(record, self.include_ecg)

@@ -51,18 +51,26 @@ PPG encoder weights remain loadable, but old feature-only archives must be
 regenerated for the guarded evaluation commands. Unknown historical teacher or
 pretraining provenance remains unknown; strict source-held-out claims are rejected.
 
-Converter v2 adds pre-interpolation diagnostics and versions its conversion contract.
-Use a fresh destination for v2 output instead of mixing v1/v2 rows through resume.
-Existing v1 HDF5 shards remain readable. See `docs/EVALUATION.md` for reference labels,
+Converter v2 adds pre-interpolation diagnostics; v3 adds explicit shared-grid timing status.
+Use a fresh destination for v3 output instead of mixing converter versions through resume.
+Existing older HDF5 shards remain readable; missing timing/device metadata stays unknown.
+PPG-only feature extraction reads stored quality/availability metadata but never ECG waveform samples.
+See `docs/EVALUATION.md` for reference labels,
 direct physiological supervision, frozen probes and full downstream fine-tuning.
 
 ## Portable use
 
 The local project folder is now `TempoBridge-COSD`. Reopen that folder in your editor;
-the Python distribution/import name is still `tempobridge`. Development version
-`0.4.0.dev1` includes the COSD and downstream pipelines. The local Windows environment
+the Python distribution/import name is still `tempobridge`. Version
+`0.4.0` includes the COSD, experiment and downstream pipelines. The local Windows environment
 was rebound to its new directory; on another machine install a fresh environment.
 
 Use `python -m tempobridge` in the active environment. Paths are supplied through CLI/config
 or resolved relative to manifests; generated caches are portable directories. Virtual environments
 are local installations, not distribution artifacts, and should be recreated on another machine.
+
+Experiment plans bind the exact package source digest. Create a new plan after a code change;
+do not edit an executed plan or bypass its content guards. Completed job outputs are verified
+before reuse. Only explicit `random_control` accepts an untrained diagnostic teacher.
+New configuration fields have backward-compatible defaults, but exact training resume remains
+bound to the normalized configuration and original objective.

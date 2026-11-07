@@ -4,4 +4,4 @@ from .config import ModelConfig
 from .model import TempoBridge
 
 __all__ = ["ModelConfig", "TempoBridge"]
-__version__ = "0.4.0.dev1"
+__version__ = "0.4.0"

@@ -7,7 +7,7 @@ import torch
 
 from tempobridge.data import make_synthetic, read_manifest
 from tempobridge.finetuning import fine_tune
-from tempobridge.inference import export_encoder
+from tempobridge.inference import export_encoder, extract_features
 from tempobridge.physio_targets import FIELDS
 from tempobridge.training import train
 from tempobridge.utils import load_checkpoint
@@ -41,3 +41,21 @@ def test_finetuning_and_random_init(tmp_path, tiny_config, task):
         with np.load(result.parent / "predictions.npz", allow_pickle=False) as predictions:
             assert len(predictions["sample_id"]) == 6 and np.isfinite(predictions["prediction"]).all()
     assert report["audit"]["unknown_pretraining_provenance"] == []
+    assert report["strata"]["ppg_quality"]["available"] is True
+    assert report["strata"]["device_id"]["available"] is False
+
+
+def test_noise_perturbation_is_per_sample_reproducible(tmp_path, tiny_config):
+    cfg = tiny_config
+    cfg.data.window_mode, cfg.data.scales_seconds = "full", [2.]
+    manifest = make_synthetic(tmp_path / "data", subjects=8, windows=3, seconds=2)
+    checkpoint = train(cfg, manifest, tmp_path / "pretraining", stop_after=1)
+    encoder = export_encoder(checkpoint, tmp_path / "encoder.pt")
+    outputs = []
+    for name, batch_size, std in (("first", 2, .4), ("second", 5, .4), ("clean", 2, 0.)):
+        path = extract_features(encoder, manifest, tmp_path / f"{name}.npz", batch_size=batch_size, noise_std=std)
+        with np.load(path, allow_pickle=False) as a:
+            outputs.append(a["embedding"].copy())
+            assert "ecg_available" in a and json.loads(str(a["metadata_json"]))["perturbation"]["std"] == std
+    np.testing.assert_allclose(outputs[0], outputs[1], atol=1e-5, rtol=1e-5)
+    assert not np.allclose(outputs[0], outputs[2])

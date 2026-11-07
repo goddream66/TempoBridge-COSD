@@ -77,8 +77,25 @@ No real-data training or GPU training is authorized for this development task; v
 - Post-relocation full suite: 251 passed, 14 dependency warnings, 81.32 seconds;
   relocated wheel import and encoder loading passed again. Old project directory
   no longer exists; runtime artifacts/environments remain excluded from Git.
-- Still required: representation/source/quality audit commands; complete experiment matrix and
-  matched-budget/rank/weight orchestration; final method/docs organization and requirement audit.
+- Final iteration implemented: representation/identity/source/quality/within-record audits;
+  predeclared experiment families; actual per-scale rank matching, sample/direction weight controls,
+  paired/unpaired subsets, native teacher readout/random controls, guarded source-held-out evaluation,
+  per-layer gradient/update diagnostics and source/quality supervision totals.
+- Experiment execution verifies source/inputs/output hashes, shares compatible warm-up/cache stages,
+  retains interrupted non-training products and resumes training at epoch checkpoints. Reports separate
+  seed variation from paired patient bootstrap; stages record wall-clock and sampled process RSS.
+- Downstream reports include quality/availability/case/device strata; PPG feature noise is reproducible
+  per sample. PPG-only paths preserve ECG quality metadata without reading ECG waveform arrays.
+  Converter v3 records shared-grid timing explicitly without claiming verified physiological delay.
+- Final CPU suite: 277 passed, 14 existing dependency warnings, 113.75 seconds. Ruff, whitespace checks,
+  all 19 configurations, and pip dependency checks passed. Seven-method CLI and verified job reuse:
+  `runs/cosd_validation/matrix_release_20261107/summary.json`.
+- Version 0.4.0 wheel built and imported outside the repository; relative-path exported encoder load
+  produced finite [2,32] features. Evidence: `runs/cosd_validation/release_portability_20261107.json`.
+  CPU benchmark also exercised inference latency, teacher overhead and partial profiler FLOPs.
+- Authorized engineering scope is complete; `REQUIREMENT_AUDIT.md` maps the source specification to
+  implementation and limitations. Real-data teacher validation, full three-seed scientific experiments,
+  clinical reference review and Go/No-Go conclusions remain unperformed research work, not test results.
 
 ## Organization references
 

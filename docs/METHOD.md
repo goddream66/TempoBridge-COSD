@@ -31,8 +31,9 @@ PPG 自监督分别从浅层支路和后层预测隐藏 patch，损失为 Huber(
 参数共享的 Ec 同时接受两种目标。关闭 protect_shallow 时移除该 stopgrad。
 这是梯度路径约束，不是冻结浅层参数；AdamW 仍会根据 PPG 梯度更新浅层。
 两次学生前向增加训练开销；推理只需要一次。
-蒸馏预测头使用完整上下文层的 patch 均值，`feature_pool` 与 `feature_layer` 定义的公共特征接口
-不会把 ECG token 接入学生。特征设置也会影响校准使用的 PPG 表征，因此修改后应重新校准。
+蒸馏与校准统一调用 `transfer_features`，固定返回最后一层 context patch 均值。
+`feature_pool` 与 `feature_layer` 仅控制对外特征接口，不改变该共享定义；ECG token 不接入学生。
+产物绑定完整模型配置，改变配置后仍需重新生成对应产物。
 
 `multiview` 保留原单核四路编码，`local` 保留独立 patch 卷积、原有 Transformer 和形态/上下文均值拼接。
 `ModelConfig.from_dict` 对缺少 `encoder` 的历史配置选择 `local`；新增实验显式指定编码器。
@@ -62,8 +63,9 @@ softmax 沿分支轴计算，
 `selective_local_context=false` 仅使用全局描述；`selective_coverage=false` 关闭幅值补偿与 logits 的对数覆盖率项，
 但它们都不会取消隐藏样本在输入特征构造前的清除。
 
-覆盖率描述已观察到多少输入，不等于生理 SQI 或校准后的可信概率；本轮没有加入频域分支、
-VQ 码本、显式心搏检测或额外生理目标。该适配是否改善泛化由单独消融判断，不作首次或性能保证。
+覆盖率描述已观察到多少输入，不等于生理 SQI 或校准后的可信概率；tokenizer 没有频域分支、
+VQ 码本或显式心搏检测。独立参考信号提取的生理目标作为另一个训练基线，不改变 tokenizer。
+该适配是否改善泛化由单独消融判断，不作首次或性能保证。
 
 ## 掩码的信息边界
 
@@ -125,16 +127,27 @@ baseline 误差接近零（例如常量教师）或患者数不足时设 a=0。
 
 ## 蒸馏损失与不退化条件
 
+以下样本加权公式对应 PW-KD。COSD 的完整坐标、患者划分及损失契约见 [COSD.md](COSD.md)。
+
     w(i,s) = ECG_quality(i) * a(s, PPG_quality_bin(i)) * ECG_available(i)
     L_transfer = mean_s [ sum_i w(i,s) * mean_dim Huber(pred_i, target_i) / batch_size ]
     L = L_PPG + lambda * L_transfer
 
-target 在训练患者全部可靠配对上估计的固定均值/标准差中标准化。
-这些全训练统计用于最终训练；OOF评分仍使用各 fit 折独立统计。
+schema 3 的最终 target 均值/标准差由 basis 患者拟合；同一 cache/划分下完整目标和投影目标共用该统计。
+完整目标在不足三个患者时才退回全部训练配对统计；COSD 不采用这一退回路径。OOF 评分仍使用各 fit 折独立统计。
 分母固定为 batch_size，不能改成 sum(weights)，否则整体低可信度会被重新归一化抵消。
 weights 与 teacher 都无梯度，selector 无法靠把自身权重降至零来最小化训练损失。
 真正全零校准则允许退回纯 PPG 自监督，明确记录“无可迁移证据”，不强行设置正覆盖率。
 模型没有通过约束保证数据分布中的罕见状态不被过滤，需在真实实验审计。
+
+COSD 将标准化后的真实 ECG 输出右乘冻结的正交方向矩阵，学生直接预测 r 维目标。
+候选基为原始坐标、PCA 或随机正交基；discovery 患者的方向 OOF skill 与条件 bootstrap
+下界决定保留方向，独立 audit 患者只能用于报告。默认 hard 方向权重为 1，soft 权重只乘在损失上。
+`normalize_direction_weights=true` 将方向权重均值归一到 1，作为独立权重总量对照。
+每个尺度可显式指定 `ranks_per_scale`；随机/PCA 对照由实验计划匹配 COSD 的实际 rank。
+
+总目标为 `ssl_weight * (L_context + alpha * L_morph) + transfer_weight * L_KD`。
+默认浅层保护不变。`physio` 基线直接预测独立 ECG/ABP/RESP 标量标签，不载入神经教师。
 
 ## 可复现实验边界
 

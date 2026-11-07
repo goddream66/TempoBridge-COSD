@@ -144,6 +144,11 @@ class TrainConfig:
     pairing_quality_match: bool = False
     pairing_weight_match: bool = True
     physio_targets: list[str] = field(default_factory=lambda: ["hr_bpm"])
+    ppg_quality_weight: bool = False
+    ecg_quality_weight: bool = True
+    normalize_direction_weights: bool = False
+    ssl_weight: float = 1.0
+    sample_subset: str = "all"
 
 
 @dataclass
@@ -173,6 +178,8 @@ class COSDConfig:
     basis_fraction: float = 0.2
     audit_fraction: float = 0.2
     soft: bool = False
+    ranks_per_scale: list[int] = field(default_factory=list)
+    quality_strata: bool = False
 
 
 @dataclass
@@ -222,6 +229,12 @@ class ExperimentConfig:
             raise ValueError("min_lr_ratio must be in [0,1]")
         if t.transfer_weight < 0 or t.morphology_loss_weight < 0:
             raise ValueError("Loss weights must be nonnegative")
+        if not 0 <= t.ssl_weight < float("inf"):
+            raise ValueError("ssl_weight must be finite and nonnegative")
+        if any(type(v) is not bool for v in (t.ppg_quality_weight, t.ecg_quality_weight, t.normalize_direction_weights)):
+            raise ValueError("Reliability/direction switches must be boolean")
+        if t.sample_subset not in {"all", "paired", "unpaired"}:
+            raise ValueError("Unknown sample_subset")
         if t.transfer_mode not in {"calibrated", "all", "quality", "random", "none"}:
             raise ValueError("Unknown transfer_mode")
         if t.transfer_method not in {"none", "vanilla", "pw_kd", "cosd", "physio"}:
@@ -254,13 +267,16 @@ class ExperimentConfig:
             raise ValueError("Unknown COSD selection")
         if type(s.rank) is not int or s.rank < 0 or type(s.repeats) is not int or s.repeats < 1:
             raise ValueError("Invalid COSD rank/repeats")
+        if s.ranks_per_scale and (len(s.ranks_per_scale) != len(d.scales_seconds) or
+                                  any(type(r) is not int or r < 0 for r in s.ranks_per_scale)):
+            raise ValueError("ranks_per_scale requires one nonnegative rank per input scale")
         if not 0 <= s.min_skill < 1 or not 0.5 < s.confidence < 1:
             raise ValueError("Invalid COSD skill/confidence")
         if type(s.bootstrap_samples) is not int or s.bootstrap_samples < 20:
             raise ValueError("COSD bootstrap_samples must be >=20")
         if not 0 < s.basis_fraction < 1 or not 0 < s.audit_fraction < 1 or s.basis_fraction + s.audit_fraction >= 1:
             raise ValueError("COSD basis/audit fractions must leave discovery patients")
-        if type(s.soft) is not bool or type(s.stability) is not bool:
+        if any(type(v) is not bool for v in (s.soft, s.stability, s.quality_strata)):
             raise ValueError("COSD switches must be boolean")
         if s.selection == "variance" and s.basis != "pca":
             raise ValueError("Variance selection requires PCA basis")

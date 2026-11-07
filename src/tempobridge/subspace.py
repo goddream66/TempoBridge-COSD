@@ -120,7 +120,7 @@ def bootstrap_skill(errors, baseline, subjects, count, confidence, seed):
     return np.quantile(draws, [alpha, 1 - alpha], axis=0)
 
 
-def fit_subspace(features, targets, subjects, sources, probe_config, config, seed):
+def fit_subspace(features, targets, subjects, sources, probe_config, config, seed, qualities=None, quality_edges=()):
     x, y = np.asarray(features, np.float64), np.asarray(targets, np.float64)
     subjects, sources = np.asarray(subjects), np.asarray(sources)
     if x.ndim != 2 or y.ndim != 2 or len(x) != len(y) or len(subjects) != len(y) or len(sources) != len(y):
@@ -140,6 +140,25 @@ def fit_subspace(features, targets, subjects, sources, probe_config, config, see
     intervals = bootstrap_skill(errors, null, subjects[discover], config.bootstrap_samples,
                                  config.confidence, seed + 101)
     criterion = intervals[0] if config.stability else skill
+    quality_reports = []
+    if config.quality_strata:
+        if qualities is None or len(qualities) != len(y):
+            raise ValueError("Quality-stratified selection requires quality metadata")
+        bins = np.digitize(np.asarray(qualities)[discover], quality_edges)
+        for group in range(len(quality_edges) + 1):
+            mask = bins == group
+            count = len(np.unique(subjects[discover][mask]))
+            if count < probe_config.min_subjects_per_bin:
+                quality_reports.append({"bin": group, "groups": count, "eligible": False})
+                criterion = np.minimum(criterion, np.zeros_like(criterion))
+                continue
+            group_errors = {k: v[mask] for k, v in errors.items()}
+            group_skill = direction_skill(group_errors, null[mask], subjects[discover][mask])
+            group_ci = bootstrap_skill(group_errors, null[mask], subjects[discover][mask],
+                                       config.bootstrap_samples, config.confidence, seed + 201 + group)
+            criterion = np.minimum(criterion, group_ci[0] if config.stability else group_skill)
+            quality_reports.append({"bin": group, "groups": count, "eligible": True,
+                                    "skill": group_skill.tolist(), "ci": group_ci.T.tolist()})
     eligible = variance > 1e-8
     if config.selection == "topk_oof_skill":
         eligible &= criterion > config.min_skill
@@ -176,6 +195,7 @@ def fit_subspace(features, targets, subjects, sources, probe_config, config, see
         "requested_rank": config.rank, "selected_directions": selected.tolist(),
         "direction_weights": loss_weights.tolist(), "direction_skill": skill.tolist(),
         "direction_ci": intervals.T.tolist(), "candidate_variance": variance.tolist(),
+        "quality_strata": quality_reports,
         "retained_energy_fraction": float(variance[selected].sum() / max(variance.sum(), 1e-8)),
         "partitions": partitions, "folds": folds,
         "audit": {"skill": audit_skill.tolist(), "by_source": source_reports,

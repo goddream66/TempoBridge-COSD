@@ -17,7 +17,7 @@ from .data import PairedDataset, manifest_digest, read_manifest, source_ids, spl
 from .model import TempoBridge, TransferHeads, random_mask, reconstruction_loss
 from .sampling import PatientSourceSampler, SourceBlockSampler
 from .teacher import FrozenTeacher
-from .transfer import distillation_loss, gradient_audit, physiological_loss
+from .transfer import distillation_loss, gradient_audit, parameter_group, physiological_loss
 from .utils import (
     device_for,
     environment,
@@ -71,19 +71,24 @@ def batch_loss(config, model, batch, device, modality, heads=None, teacher=None,
                     batch["ecg_valid"].to(device), batch["ppg_quality"].to(device),
                     batch["ecg_quality"].to(device), index,
                     config.train.transfer_mode, config.train.protect_shallow,
+                    config.train.ppg_quality_weight, config.train.ecg_quality_weight,
+                    config.train.normalize_direction_weights,
+                    sources=batch["source"],
                 )
             kd.append(loss)
             transfer_metrics.append(terms)
     self_loss = torch.stack(ssl).mean()
     distillation = torch.stack(kd).mean() if kd else self_loss.new_zeros(())
-    total = self_loss + config.train.transfer_weight * distillation
+    total = config.train.ssl_weight * self_loss + config.train.transfer_weight * distillation
     names = ("mean_transfer_weight", "paired_fraction", "active_transfer_fraction", "target_rank")
     metrics = {name: sum(m[name] for m in transfer_metrics) / len(transfer_metrics)
                if transfer_metrics else 0. for name in names}
+    for name in set().union(*(m.keys() for m in transfer_metrics)) - set(names):
+        metrics[name] = sum(m.get(name, 0.) for m in transfer_metrics) / len(transfer_metrics)
     metrics["paired_fraction"] = float(batch["ecg_valid"][keep].float().mean())
     metrics["original_paired_fraction"] = float(batch.get("original_ecg_valid", batch["ecg_valid"])[keep].float().mean())
     if audit_gradients:
-        metrics.update(gradient_audit(self_loss, distillation, model, config.train.transfer_weight))
+        metrics.update(gradient_audit(config.train.ssl_weight * self_loss, distillation, model, config.train.transfer_weight))
     return total, {"ssl": float(self_loss.detach()), "transfer": float(distillation.detach()),
                    **metrics}
 
@@ -125,6 +130,8 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
         raise FileExistsError("Run already has last.pt; use --resume or another output directory")
     output.mkdir(parents=True, exist_ok=True)
     stage = "physio" if reference_targets_path else "distill" if teacher_path else "pretrain"
+    if stage == "pretrain" and config.train.ssl_weight == 0:
+        raise ValueError("Pretraining without transfer requires positive SSL weight")
     if config.train.transfer_method == "physio" and stage != "physio":
         raise ValueError("Physio method requires --reference-targets")
     if stage == "physio" and (teacher_path or calibration_path or modality != "ppg" or
@@ -168,6 +175,10 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
         if config.train.transfer_mode == "calibrated" and not (calibrator.weights > 0).any():
             print("NOTICE: all calibrated weights are zero; retaining PPG self-supervision only.", flush=True)
     dataset = PairedDataset(records, config.data, seed=config.train.seed)
+    if config.train.sample_subset != "all":
+        from .controls import WindowSubsetDataset
+        dataset = WindowSubsetDataset(dataset, config.train.sample_subset)
+        write_json(output / "sample_subset.json", dataset.report())
     if stage == "physio":
         from .physio_targets import (
             ReferenceDataset,
@@ -253,6 +264,7 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
         metrics, examples = {name: 0. for name in ("loss", "ssl", "transfer", "mean_transfer_weight",
                                                   "paired_fraction", "original_paired_fraction",
                                                   "active_transfer_fraction", "target_rank")}, 0
+        update_norms, update_audits = {}, 0
         iterator = iter(loader)
         while group := list(itertools.islice(iterator, config.train.accumulation)):
             counts = [int(b["ecg_valid"].sum()) if modality == "ecg" else len(b["ecg_valid"]) for b in group]
@@ -276,8 +288,17 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
                 examples += batch_count
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(parameters, config.train.grad_clip, error_if_nonfinite=True)
+            before = {name: p.detach().clone() for name, p in model.named_parameters()} if audit_gradients else {}
             scaler.step(optimizer)
             scaler.update()
+            if before:
+                squared = {}
+                for name, p in model.named_parameters():
+                    key = parameter_group(name)
+                    squared[key] = squared.get(key, 0.) + float((p.detach() - before[name]).float().square().sum())
+                for key, value in squared.items():
+                    update_norms[key] = update_norms.get(key, 0.) + value ** .5
+                update_audits += 1
             scheduler.step()
             global_step += 1
         if not examples:
@@ -306,9 +327,12 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
         row = {"epoch": epoch + 1, "global_step": global_step, **{k: v / examples for k, v in metrics.items()},
                "val_reconstruction": val, "lr": optimizer.param_groups[0]["lr"],
                "seconds": time.monotonic() - started, "examples": examples}
-        for key in ("ssl_gradient_norm", "kd_gradient_norm", "gradient_cosine"):
-            if key in metrics:
+        for key in metrics:
+            if key.startswith(("ssl_gradient_norm", "kd_gradient_norm")) or key == "gradient_cosine":
                 row[key] = metrics[key] / max(metrics["gradient_audit_fraction"], 1.)
+        row.update({f"parameter_update_norm/{key}": value / update_audits for key, value in update_norms.items()})
+        row.update({key: value for key, value in metrics.items() if key.startswith("kd_coverage/")})
+        row["parameter_update_audits"] = update_audits
         row["paired_windows"] = metrics["paired_fraction"]
         row["original_paired_windows"] = metrics["original_paired_fraction"]
         row["active_transfer_windows"] = metrics["active_transfer_fraction"]

@@ -69,6 +69,8 @@ def test_cosd_training_resume_and_export(tmp_path, tiny_config):
     metrics = [json.loads(line) for line in (tmp_path / "full" / "metrics.jsonl").read_text().splitlines()]
     assert all(m["target_rank"] == 4 and m["active_transfer_fraction"] > 0 for m in metrics)
     assert all(np.isfinite(m["kd_gradient_norm"]) and m["gradient_audit_fraction"] > 0 for m in metrics)
+    assert all(m["kd_gradient_norm/stem"] == 0 and m["kd_gradient_norm/shallow.0"] == 0 for m in metrics)
+    assert all(m["ssl_gradient_norm/stem"] > 0 and m["parameter_update_norm/stem"] > 0 for m in metrics)
     assert load_checkpoint(tmp_path / "full" / "best.pt")["global_step"] == a["global_step"]
 
 

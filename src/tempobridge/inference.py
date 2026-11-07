@@ -1,5 +1,6 @@
 """Export/load a PPG-only encoder without a teacher or calibration dependency."""
 
+import hashlib
 from pathlib import Path
 
 import numpy as np
@@ -47,9 +48,12 @@ def load_encoder(path, device="cpu"):
 
 
 @torch.inference_mode()
-def extract_features(checkpoint, manifest, output, split="test", device="cpu", batch_size=32):
+def extract_features(checkpoint, manifest, output, split="test", device="cpu", batch_size=32,
+                     noise_std=0., noise_seed=42):
     if Path(output).exists():
         raise FileExistsError(output)
+    if not 0 <= noise_std < float("inf"):
+        raise ValueError("Noise standard deviation must be finite and nonnegative")
     state = load_checkpoint(checkpoint)
     config = DataConfig.from_dict(state["data_config"])
     records = read_manifest(manifest, require_train=False, data_config=config)
@@ -60,20 +64,33 @@ def extract_features(checkpoint, manifest, output, split="test", device="cpu", b
     values = []
     fields = {k: [] for k in ("sample_id", "subject_id", "source", "recording_id", "case_id",
                                "window_start_s", "ppg_quality", "ecg_quality", "subject_known",
-                               "identity_level", "recording_known")}
+                               "identity_level", "recording_known", "ppg_quality_source", "ecg_quality_source",
+                               "timestamp_alignment_status", "device_id")}
     for batch in loader:
-        values.append(model(batch["ppg"][scale].to(device)).cpu().numpy())
+        waves = batch["ppg"][scale]
+        if noise_std:
+            waves = waves.clone()
+            for i, sample in enumerate(batch["sample_id"]):
+                seed = int.from_bytes(hashlib.sha256(f"{noise_seed}:{sample}".encode()).digest()[:8], "big")
+                generator = torch.Generator().manual_seed(seed)
+                noise = torch.randn(waves[i].shape, generator=generator)
+                waves[i] += noise * noise_std * waves[i].std(correction=0)
+        values.append(model(waves.to(device)).cpu().numpy())
         for key in fields:
             item = batch[key]
             fields[key].extend(item.tolist() if isinstance(item, torch.Tensor) else item)
-    dataset.close()
     Path(output).parent.mkdir(parents=True, exist_ok=True)
     if not values:
         raise ValueError(f"No feature rows in split {split}")
     import json
     metadata = {"schema_version": 2, "split": split,
+                "quality_edges": config.quality_edges,
+                "perturbation": {"kind": "relative_white_gaussian", "std": noise_std, "seed": noise_seed},
                 "encoder_sha256": file_sha256(checkpoint), "manifest_sha256": manifest_digest(records),
                 "pretraining": state.get("pretraining_provenance", {})}
-    np.savez(output, embedding=np.concatenate(values), **{k: np.asarray(v) for k, v in fields.items()},
+    availability = np.asarray([dataset.metadata(i)["ecg_available"] for i in range(len(dataset))])
+    dataset.close()
+    np.savez(output, embedding=np.concatenate(values), ecg_available=availability,
+             **{k: np.asarray(v) for k, v in fields.items()},
              scale_seconds=config.scales_seconds[scale], metadata_json=json.dumps(metadata))
     return Path(output)

@@ -27,6 +27,35 @@ def main(argv=None):
     p.add_argument("--bootstrap-samples", type=int, default=200)
     p.add_argument("--protocol", choices=["group_disjoint", "source_held_out"], default="group_disjoint")
     p.add_argument("--target-source")
+    p.add_argument("--test-manifest", help="Optional separate test corpus; original group assignments are retained")
+    p = sub.add_parser("filter-sources", help="Create a corpus view without changing group splits")
+    for name in ("manifest", "output"):
+        p.add_argument("--" + name, required=True)
+    p.add_argument("--sources", nargs="+", required=True)
+    p.add_argument("--config")
+    p = sub.add_parser("plan-experiments", help="Write a reviewable ablation plan without training")
+    for name in ("config", "manifest", "output"):
+        p.add_argument("--" + name, required=True)
+    p.add_argument("--seeds", type=int, nargs="+", default=[17, 29, 43])
+    p.add_argument("--families", nargs="+", default=["core"])
+    p.add_argument("--labels")
+    p.add_argument("--targets", nargs="*", default=[], help="name:regression or name:classification")
+    p.add_argument("--label-fractions", type=float, nargs="+", default=[.01, .05, .1, .25, 1.])
+    p.add_argument("--teacher")
+    p.add_argument("--teacher-kind", choices=["native", "torchscript", "random_control"], default="native")
+    p.add_argument("--skip-finetune", action="store_true")
+    p.add_argument("--bootstrap-samples", type=int, default=200)
+    p = sub.add_parser("run-experiments", help="Inspect a plan; --execute explicitly runs its stages")
+    p.add_argument("--plan", required=True)
+    p.add_argument("--execute", action="store_true")
+    p.add_argument("--only", nargs="*", default=[])
+    p = sub.add_parser("teacher-variant", help="Declare a frozen native teacher readout or an explicit random diagnostic")
+    p.add_argument("--checkpoint", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--layer", type=int, default=-1)
+    p.add_argument("--pool", choices=["context_mean", "summary", "combined"], default="context_mean")
+    p.add_argument("--normalization", choices=["none", "l2"], default="none")
+    p.add_argument("--random-seed", type=int, help="Create untrained negative-control weights; requires teacher-kind=random_control downstream")
     p = sub.add_parser("audit-data", help="Validate manifest identities and signal shapes")
     p.add_argument("--manifest", required=True)
     p.add_argument("--config", required=True)
@@ -67,7 +96,7 @@ def main(argv=None):
         else:
             p.add_argument("--student", required=True)
             p.add_argument("--teacher", required=True)
-            p.add_argument("--teacher-kind", choices=["native", "torchscript"], default="native")
+            p.add_argument("--teacher-kind", choices=["native", "torchscript", "random_control"], default="native")
         if name == "distill":
             p.add_argument("--calibration", help="Required for PW-KD/COSD; vanilla computes target statistics only")
         if name == "calibrate":
@@ -79,6 +108,13 @@ def main(argv=None):
     p.add_argument("--config", required=True)
     p.add_argument("--cache", required=True)
     p.add_argument("--output", required=True)
+    p = sub.add_parser("audit-representation", help="Frozen teacher/student identity, source, quality and within-record audits")
+    for name in ("cache", "calibration", "output"):
+        p.add_argument("--" + name, required=True)
+    p.add_argument("--labels")
+    p.add_argument("--targets", nargs="*", default=[])
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--max-identity-groups", type=int, default=256)
     p = sub.add_parser("export")
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--output", required=True)
@@ -89,6 +125,8 @@ def main(argv=None):
     p.add_argument("--split", choices=["train", "val", "test"], default="test")
     p.add_argument("--device", default="cpu")
     p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--noise-std", type=float, default=0., help="White Gaussian noise relative to each PPG window standard deviation")
+    p.add_argument("--noise-seed", type=int, default=42)
     p = sub.add_parser("evaluate-probe", help="Patient-disjoint frozen linear probe with validation-only selection")
     for name in ("train-features", "val-features", "test-features", "labels", "target", "output"):
         p.add_argument("--" + name, required=True)
@@ -109,6 +147,26 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.command == "synthetic":
         result = make_synthetic(args.output, args.subjects, args.windows, args.seconds, args.fs, args.seed)
+    elif args.command == "filter-sources":
+        from .manifest_tools import filter_sources
+        result = filter_sources(args.manifest, args.output, args.sources,
+                                ExperimentConfig.load(args.config).data if args.config else None)
+    elif args.command == "teacher-variant":
+        from .teacher_controls import teacher_variant
+        result = teacher_variant(args.checkpoint, args.output, args.layer, args.pool, args.normalization, args.random_seed)
+    elif args.command == "plan-experiments":
+        from .experiments import plan_experiments
+        if any(len(t.split(":")) != 2 for t in args.targets):
+            parser.error("--targets expects name:regression or name:classification")
+        targets = [dict(zip(("name", "task"), t.split(":"), strict=True)) for t in args.targets]
+        result = plan_experiments(args.config, args.manifest, args.output, args.seeds, args.families,
+                                 args.labels, targets, args.label_fractions, args.teacher,
+                                 args.teacher_kind, not args.skip_finetune, args.bootstrap_samples)
+    elif args.command == "run-experiments":
+        from .experiments import run_experiments
+        result = run_experiments(args.plan, args.execute, args.only)
+        if isinstance(result, dict):
+            result = json.dumps(result)
     elif args.command == "reference-targets":
         from .physio_targets import build_reference_targets
         result = build_reference_targets(args.references, args.output)
@@ -124,6 +182,7 @@ def main(argv=None):
                              "sources": list(result["sources"])})
     elif args.command == "audit-data":
         import random
+        from collections import Counter
 
         from .data import PairedDataset, split_size, subject_ids
         cfg = ExperimentConfig.load(args.config)
@@ -138,8 +197,10 @@ def main(argv=None):
                            random.Random(cfg.train.seed).sample(range(len(dataset)),
                                                                min(args.max_windows, len(dataset))))
                 missing = sum(not dataset[i]["ecg_valid"] for i in indices)
+                alignment = Counter(dataset.metadata(i)["timestamp_alignment_status"] for i in indices)
                 counts[split] = {"samples": len(dataset), "checked_windows": len(indices),
                                  "missing_ecg_in_checked_windows": missing,
+                                 "timestamp_alignment_in_checked_windows": dict(alignment),
                                  "known_groups": len(subject_ids(records, split))}
                 dataset.close()
         result = json.dumps(counts)
@@ -154,6 +215,10 @@ def main(argv=None):
         from .feature_cache import FeatureCache
         artifact = calibrate_cached(ExperimentConfig.load(args.config), FeatureCache(args.cache), args.output)
         result = json.dumps({"output": args.output, "method": artifact["method"]})
+    elif args.command == "audit-representation":
+        from .representation_audit import audit_representations
+        result = audit_representations(args.cache, args.calibration, args.output, args.labels,
+                                       args.targets, args.seed, args.max_identity_groups)
     elif args.command == "cache-features":
         from .feature_cache import cache_features
         result = cache_features(ExperimentConfig.load(args.config), args.manifest, args.student,
@@ -182,10 +247,10 @@ def main(argv=None):
         from .finetuning import fine_tune
         result = fine_tune(ExperimentConfig.load(args.config), args.manifest, args.labels, args.target,
                            args.output, args.encoder, args.task, args.label_fraction, args.bootstrap_samples,
-                           args.protocol, args.target_source)
+                           args.protocol, args.target_source, args.test_manifest)
     else:
         result = extract_features(args.checkpoint, args.manifest, args.output,
-                                  args.split, args.device, args.batch_size)
+                                  args.split, args.device, args.batch_size, args.noise_std, args.noise_seed)
     print(result, flush=True)
 
 

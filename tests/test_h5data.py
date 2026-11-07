@@ -111,6 +111,33 @@ def test_mixed_ecg_and_quality_reading_without_reprocessing(tmp_path):
     reader.close()
 
 
+def test_ppg_only_metadata_preserves_quality_device_and_alignment(tmp_path, monkeypatch):
+    shard = write_shard(tmp_path / "shards" / "part.h5", list(range(40)))
+    with h5py.File(shard, "r+") as h:
+        h["ecg_quality"] = np.full(40, .4)
+        h["device_id"] = np.full(40, 7)
+        h["timestamp_alignment_status"] = np.asarray(["shared_grid_unverified_interchannel_delay"] * 40,
+                                                       dtype=h5py.string_dtype())
+    spec = tmp_path / "sources.json"
+    spec.write_text(json.dumps({"sources": {"a": {"root": "shards", "fs": 50}}}))
+    manifest = tmp_path / "manifest.json"
+    build_h5_manifest(spec, manifest)
+    original = h5py.Dataset.__getitem__
+
+    def guarded(dataset, *args, **kwargs):
+        if dataset.name == "/ecg_wave":
+            raise AssertionError("PPG-only evaluation must not load ECG waveform samples")
+        return original(dataset, *args, **kwargs)
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", guarded)
+    dataset = PairedDataset(read_manifest(manifest), DataConfig(scales_seconds=[2.]), include_ecg=False)
+    sample, metadata = dataset[0], dataset.metadata(0)
+    assert sample["ecg_quality"] == metadata["ecg_quality"] == .4
+    assert sample["device_id"] == metadata["device_id"] == "a:int:7"
+    assert sample["timestamp_alignment_status"] == "shared_grid_unverified_interchannel_delay"
+    assert not sample["ecg_valid"] and metadata["ecg_available"]
+    dataset.close()
+
+
 def test_content_integrity_and_relocation(tmp_path):
     manifest = make_index(tmp_path)
     original = H5RecordIndex(manifest)

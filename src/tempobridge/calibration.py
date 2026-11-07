@@ -5,7 +5,7 @@ This estimates learnability under these probes, not intrinsic observability or u
 """
 
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
@@ -148,8 +148,8 @@ def calibrate_cached(config, cache, output):
     subjects, qualities = cache.column("subject_id"), cache.column("ppg_quality")
     sources = cache.column("source")
     method = config.train.transfer_method
-    if method == "none":
-        raise ValueError("SSL-only training does not require calibration")
+    if method in {"none", "physio"}:
+        raise ValueError("SSL/physiological supervision does not require teacher calibration")
     partitions = (partition_patients(subjects, config.cosd, config.train.seed)
                   if len(np.unique(subjects)) >= 3 else None)
     normalizers = np.isin(subjects, partitions["basis"]) if partitions else np.ones(len(subjects), bool)
@@ -165,8 +165,10 @@ def calibrate_cached(config, cache, output):
         mean, variance = patient_moments(y[normalizers], subjects[normalizers])
         report.update(target_mean=mean.tolist(), target_scale=np.sqrt(variance).clip(1e-4).tolist())
         if method == "cosd":
+            subspace_config = (replace(config.cosd, rank=config.cosd.ranks_per_scale[scale])
+                               if config.cosd.ranks_per_scale else config.cosd)
             report["subspace"] = fit_subspace(x, y, subjects, sources, config.calibration,
-                                               config.cosd, config.train.seed)
+                                               subspace_config, config.train.seed, qualities, config.data.quality_edges)
         reports.append(report)
     result = {
         "schema_version": 3, "method": method, "student_sha256": a["student_sha256"],
@@ -226,10 +228,12 @@ class CalibrationWeights(nn.Module):
         if a.get("feature_spec") != expected_spec:
             raise ValueError("Stale/incompatible calibration: feature_spec")
         if a["schema_version"] == 3:
+            from .config import COSDConfig
+            saved_cosd = asdict(COSDConfig(**a["cosd_config"]))
             for key, expected_value in {"method": config.train.transfer_method,
                                         "cosd_config": asdict(config.cosd),
                                         "calibration_config": asdict(config.calibration)}.items():
-                if a.get(key) != expected_value:
+                if (saved_cosd if key == "cosd_config" else a.get(key)) != expected_value:
                     raise ValueError(f"Stale/incompatible calibration: {key}")
             if config.train.transfer_method == "cosd" and any("subspace" not in s for s in a["scales"]):
                 raise ValueError("COSD artifact is missing a subspace")
@@ -242,7 +246,8 @@ class CalibrationWeights(nn.Module):
         if not torch.isfinite(self.mean).all() or not torch.isfinite(self.scale).all() or (self.scale <= 0).any():
             raise ValueError("Invalid target standardization")
 
-    def lookup(self, scale_index, ppg_quality, ecg_quality, valid, mode="calibrated"):
+    def lookup(self, scale_index, ppg_quality, ecg_quality, valid, mode="calibrated",
+               ppg_quality_weight=False, ecg_quality_weight=True):
         bins = torch.bucketize(ppg_quality.float(), self.edges, right=True)
         base = self.weights[scale_index, bins]
         if mode == "random":
@@ -251,7 +256,12 @@ class CalibrationWeights(nn.Module):
             base = torch.ones_like(base)
         if mode == "none":
             base = torch.zeros_like(base)
-        reliability = torch.ones_like(base) if mode == "all" else ecg_quality.float()
+        reliability = torch.ones_like(base)
+        if mode != "all":
+            if ecg_quality_weight:
+                reliability = reliability * ecg_quality.float()
+            if ppg_quality_weight:
+                reliability = reliability * ppg_quality.float()
         return (base * reliability * valid.float()).detach()
 
     def normalize(self, target, scale_index):

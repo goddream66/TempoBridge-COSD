@@ -339,7 +339,14 @@ class H5Reader:
         handle = self._handle(record)
         i = record.h5_row
         metadata = {"recording_id": "", "recording_known": False, "window_start_s": -1.0,
-                    "case_id": "", "ppg_quality_source": "unknown", "ecg_quality_source": "unknown"}
+                    "case_id": "", "ppg_quality_source": "unknown", "ecg_quality_source": "unknown",
+                    "timestamp_alignment_status": "unknown", "device_id": ""}
+        if "device_id" in handle:
+            value = normalize_identifier(handle["device_id"][i])
+            metadata["device_id"] = f"{record.source}:{value}" if value is not None else ""
+        if "timestamp_alignment_status" in handle:
+            value = handle["timestamp_alignment_status"][i]
+            metadata["timestamp_alignment_status"] = value.decode() if isinstance(value, bytes) else str(value)
         for field in ("record_key", "record_id"):
             if field in handle:
                 value = normalize_identifier(handle[field][i])
@@ -355,16 +362,24 @@ class H5Reader:
                 metadata["window_start_s"] = value
         metadata["ecg_available"] = "ecg_wave" in handle and ("has_ecg" not in handle or bool(handle["has_ecg"][i]))
         metadata["ppg_quality"] = float(handle["ppg_quality"][i]) if "ppg_quality" in handle else 1.0
+        if "ppg_quality" in handle:
+            metadata["ppg_quality_source"] = str(handle.attrs.get("ppg_quality_definition", "stored_unspecified"))
         if "ppg_quality" not in handle:
             names = handle.attrs.get("metric_keys", "")
             names = names.decode() if isinstance(names, bytes) else names
             names = names.split(",") if isinstance(names, str) else list(names)
             if "metrics" in handle and "sqi" in names:
                 metadata["ppg_quality"] = float(handle["metrics"][i, names.index("sqi")])
+                metadata["ppg_quality_source"] = "metrics:sqi"
             elif "patch_sqi" in handle:
                 metadata["ppg_quality"] = float(np.mean(handle["patch_sqi"][i]))
+                metadata["ppg_quality_source"] = "patch_sqi_mean"
         if not np.isfinite(metadata["ppg_quality"]) or not 0 <= metadata["ppg_quality"] <= 1:
             metadata["ppg_quality"] = 0.
+        quality = float(handle["ecg_quality"][i]) if "ecg_quality" in handle else 1.
+        metadata["ecg_quality"] = quality if np.isfinite(quality) and 0 <= quality <= 1 else 0.
+        if "ecg_quality" in handle:
+            metadata["ecg_quality_source"] = str(handle.attrs.get("ecg_quality_definition", "stored_unspecified"))
         metadata["identity_level"] = "unknown"
         for field in ID_KEYS:
             if field in handle and normalize_identifier(handle[field][i]) is not None:
@@ -398,8 +413,8 @@ class H5Reader:
         if pq is None and "patch_sqi" in handle:
             pq = float(np.mean(handle["patch_sqi"][i]))
             metadata["ppg_quality_source"] = "patch_sqi_mean"
-        eq = float(handle["ecg_quality"][i]) if include_ecg and "ecg_quality" in handle else 1.0
-        if include_ecg and "ecg_quality" in handle:
+        eq = float(handle["ecg_quality"][i]) if "ecg_quality" in handle else 1.0
+        if "ecg_quality" in handle:
             metadata["ecg_quality_source"] = str(handle.attrs.get("ecg_quality_definition", "stored_unspecified"))
         pq = 1.0 if pq is None else pq
         if not np.isfinite(pq) or not 0 <= pq <= 1:

@@ -207,6 +207,33 @@ def predict_linear(probe, x):
     return softmax(values, axis=1) if probe["task"] == "classification" else values
 
 
+def stratified_metrics(part, prediction, task, quality_edges=(.33, .67)):
+    """Descriptive groups, with missing metadata and bounded case output explicit."""
+    output = {}
+    for key in ("ppg_quality", "ecg_quality", "ecg_available", "case_id", "recording_id", "device_id"):
+        if key not in part:
+            output[key] = {"available": False, "reason": "metadata_not_recorded"}
+            continue
+        values = part[key]
+        if key.endswith("quality"):
+            values = np.where(np.isfinite(values), np.digitize(values, quality_edges), -1)
+            if key + "_source" in part:
+                values = np.where(part[key + "_source"] == "unknown", -1, values)
+        unique = sorted(set(values.tolist()), key=str)
+        if key in {"case_id", "recording_id", "device_id"}:
+            unique = [v for v in unique if str(v) not in {"", "unknown", "None", "-1"}]
+        rows = {}
+        for value in unique[:256]:
+            take = values == value
+            rows[str(value)] = {"windows": int(take.sum()), "groups": len(set(part["subject_id"][take])),
+                "metrics": task_metrics(part["y"][take], prediction[take], part["subject_id"][take], task)}
+        output[key] = {"available": bool(rows), "groups": rows, "total_strata": len(unique),
+                       "truncated": len(unique) > 256}
+        if key.endswith("quality"):
+            output[key]["edges"] = list(quality_edges)
+    return output
+
+
 def evaluate_probe(train_features, val_features, test_features, labels, target, output,
                    task="regression", label_fraction=1., seed=42, regularizations=(.1, 1., 10.),
                    bootstrap_samples=200, protocol="group_disjoint", target_source=None, steps=300):
@@ -266,6 +293,8 @@ def evaluate_probe(train_features, val_features, test_features, labels, target, 
               "candidates": [{"regularization": r, "validation_score": s} for s, r, _ in candidates],
               "counts": {k: {"windows": len(v["y"]), "groups": len(set(v["subject_id"]))} for k, v in prepared.items()},
               "test": metrics, "by_source": by_source, "audit": audit,
+              "strata": stratified_metrics(test, prediction, task, parts["test"]["metadata"].get("quality_edges", [.33, .67])),
+              "test_perturbation": parts["test"]["metadata"].get("perturbation"),
               "bootstrap": cluster_intervals(test["y"], prediction, test["subject_id"], task, bootstrap_samples, seed),
               "provenance": {"labels_sha256": table.fingerprint,
                              "features": {k: v["file_sha256"] for k, v in parts.items()}}}
