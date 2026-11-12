@@ -119,7 +119,7 @@ def evaluate_reconstruction(config, model, records, device, modality="ppg"):
 
 def train(config, manifest, output, modality="ppg", student_path=None, teacher_path=None,
           calibration_path=None, teacher_kind="native", resume=None, stop_after=None,
-          reference_targets_path=None):
+          reference_targets_path=None, event_targets_path=None):
     config.validate()
     seed_all(config.train.seed, config.train.threads)
     device = device_for(config.train.device)
@@ -129,7 +129,16 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
     if (output / "last.pt").exists() and resume is None:
         raise FileExistsError("Run already has last.pt; use --resume or another output directory")
     output.mkdir(parents=True, exist_ok=True)
-    stage = "physio" if reference_targets_path else "distill" if teacher_path else "pretrain"
+    stage = ("event" if event_targets_path else "physio" if reference_targets_path else
+             "distill" if teacher_path else "pretrain")
+    if stage == "event":
+        latent = config.event.dynamic_weight > 0 and config.event.dynamic_target == "latent"
+        if (modality != "ppg" or not student_path or reference_targets_path or calibration_path
+                or config.train.transfer_method != "none" or config.train.pairing_control != "none"
+                or config.data.window_mode != "full" or not config.train.ssl_weight):
+            raise ValueError("V3 needs PPG warm-up, full windows, SSL and transfer_method=none")
+        if bool(teacher_path) != latent:
+            raise ValueError("V3 requires a frozen ECG teacher only for latent dynamic supervision")
     if stage == "pretrain" and config.train.ssl_weight == 0:
         raise ValueError("Pretraining without transfer requires positive SSL weight")
     if config.train.transfer_method == "physio" and stage != "physio":
@@ -145,6 +154,7 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
         raise ValueError("PW-KD/COSD requires a calibration artifact")
     model = TempoBridge(config.model).to(device)
     teacher, calibrator, heads = None, None, None
+    initial, collate_fn, event_dynamic_dim = None, None, 0
     provenance = {"student_sha256": None, "teacher_sha256": None, "calibration_sha256": None,
                   "teacher_kind": teacher_kind if teacher_path else None, "reference_sha256": None}
     if student_path:
@@ -159,7 +169,7 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
             raise ValueError("Warm-up checkpoint has not been trained")
         model.load_state_dict(initial["model"])
         provenance["student_sha256"] = file_sha256(student_path)
-    if teacher_path:
+    if teacher_path and stage != "event":
         if calibration_path is None:
             from .calibration import calibrate
             calibration_path = output / "target_statistics.json"
@@ -193,6 +203,33 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
         heads = TransferHeads(config.model.dim, len(config.train.physio_targets), config.data.scales_seconds).to(device)
         provenance["reference_sha256"] = table.fingerprint
         dataset = ReferenceDataset(dataset, table, config.train.physio_targets)
+    if stage == "event":
+        from .dynamic_transfer import EventTransferHeads, compute_v3_loss
+        from .event_targets import EventDataset, EventTable, collate_events
+
+        table = EventTable(event_targets_path, digest, config.data.scales_seconds[0])
+        provenance["event_targets_sha256"] = table.fingerprint
+        if teacher_path:
+            teacher = FrozenTeacher(teacher_path, teacher_kind).to(device)
+            teacher.verify_data(records, config.data.ecg_fs)
+            provenance["teacher_sha256"] = teacher.fingerprint
+        if config.event.dynamic_weight:
+            event_dynamic_dim = teacher.target_dim if teacher else len(config.event.dynamic_metrics)
+        heads = EventTransferHeads(config, event_dynamic_dim).to(device)
+        if initial.get("stage") == "event":
+            heads.events.load_state_dict({key.removeprefix("events."): value
+                                          for key, value in initial["heads"].items() if key.startswith("events.")})
+        dataset = EventDataset(dataset, table, config.event)
+        collate_fn = collate_events
+        if config.event.rr_weight and not dataset.verified_covered:
+            dataset.close()
+            raise ValueError("RR training requires schema-2 clock evidence on training windows; rebuild event targets")
+        pairs = int((dataset.neighbors >= 0).sum()) if dataset.neighbors is not None else 0
+        if config.event.dynamic_weight and not pairs:
+            raise ValueError("No adjacent, non-overlapping same-record training pairs with known timestamps")
+        write_json(output / "event_coverage.json", {"windows": len(dataset), "reference_windows": dataset.covered,
+                   "clock_verified_reference_windows": dataset.verified_covered,
+                   "candidate_pairs": pairs, "event_targets_sha256": table.fingerprint})
     if stage == "distill" and config.train.pairing_control != "none":
         from .controls import PairingControlDataset
         dataset = PairingControlDataset(dataset, config.train, config.data.quality_edges)
@@ -257,14 +294,17 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
         loader = DataLoader(dataset, batch_size=config.train.batch_size,
                             shuffle=sampler is None, sampler=sampler,
                             generator=torch.Generator().manual_seed(config.train.seed + epoch),
-                            num_workers=config.data.workers, pin_memory=device.type == "cuda")
+                            num_workers=config.data.workers, pin_memory=device.type == "cuda", collate_fn=collate_fn)
         model.train()
         if heads:
             heads.train()
         metrics, examples = {name: 0. for name in ("loss", "ssl", "transfer", "mean_transfer_weight",
                                                   "paired_fraction", "original_paired_fraction",
                                                   "active_transfer_fraction", "target_rank")}, 0
-        update_norms, update_audits = {}, 0
+        update_norms, update_audits, audit_examples = {}, 0, {}
+        audited_parameters = list(model.named_parameters())
+        if stage == "event":
+            audited_parameters += [(f"head/{name}", p) for name, p in heads.named_parameters()]
         iterator = iter(loader)
         while group := list(itertools.islice(iterator, config.train.accumulation)):
             counts = [int(b["ecg_valid"].sum()) if modality == "ecg" else len(b["ecg_valid"]) for b in group]
@@ -277,23 +317,28 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
                 with autocast_context(config, device):
                     audit_gradients = (config.train.gradient_audit_interval > 0 and
                                        global_step % config.train.gradient_audit_interval == 0)
-                    loss, terms = batch_loss(config, model, batch, device, modality, heads, teacher,
-                                             calibrator, audit_gradients=audit_gradients)
+                    if stage == "event":
+                        loss, terms = compute_v3_loss(config, model, heads, batch, teacher, device, audit_gradients, epoch)
+                    else:
+                        loss, terms = batch_loss(config, model, batch, device, modality, heads, teacher,
+                                                 calibrator, audit_gradients=audit_gradients)
                 if not torch.isfinite(loss):
                     raise FloatingPointError("Nonfinite training loss")
                 scaler.scale(loss * batch_count / sum(counts)).backward()
                 metrics["loss"] += float(loss.detach()) * batch_count
                 for key, value in terms.items():
-                        metrics[key] = metrics.get(key, 0.) + value * batch_count
+                    metrics[key] = metrics.get(key, 0.) + value * batch_count
+                    if key.startswith(("v3_gradient_norm/", "v3_gradient_cosine/", "v3_loss/")):
+                        audit_examples[key] = audit_examples.get(key, 0) + batch_count
                 examples += batch_count
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(parameters, config.train.grad_clip, error_if_nonfinite=True)
-            before = {name: p.detach().clone() for name, p in model.named_parameters()} if audit_gradients else {}
+            before = {name: p.detach().clone() for name, p in audited_parameters} if audit_gradients else {}
             scaler.step(optimizer)
             scaler.update()
             if before:
                 squared = {}
-                for name, p in model.named_parameters():
+                for name, p in audited_parameters:
                     key = parameter_group(name)
                     squared[key] = squared.get(key, 0.) + float((p.detach() - before[name]).float().square().sum())
                 for key, value in squared.items():
@@ -303,6 +348,14 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
             global_step += 1
         if not examples:
             raise ValueError("No usable training examples for selected modality")
+        if stage == "event" and epoch == 0:
+            expected = {"v3_rr_eligible_per_window": config.event.rr_weight,
+                        "v3_event_fraction": max(config.event.foot_weight, config.event.peak_weight,
+                                                 config.event.quality_proxy_weight),
+                        "v3_dynamic_pair_fraction": config.event.dynamic_weight}
+            missing = [key for key, weight in expected.items() if weight and not metrics.get(key)]
+            if missing:
+                raise ValueError(f"No valid V3 supervision in the first training epoch: {missing}")
         val = evaluate_reconstruction(config, model, records, device, modality)
         improved = config.train.checkpoint_selection == "last" or (val is not None and val < best)
         if improved:
@@ -321,6 +374,8 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
             "rng_cpu": torch.get_rng_state(),
             "rng_cuda": torch.cuda.get_rng_state_all() if device.type == "cuda" else [],
         }
+        if stage == "event":
+            state["event_dynamic_dim"] = event_dynamic_dim
         save_checkpoint(output / "last.pt", state)
         if improved:
             save_checkpoint(output / "best.pt", state)
@@ -330,6 +385,7 @@ def train(config, manifest, output, modality="ppg", student_path=None, teacher_p
         for key in metrics:
             if key.startswith(("ssl_gradient_norm", "kd_gradient_norm")) or key == "gradient_cosine":
                 row[key] = metrics[key] / max(metrics["gradient_audit_fraction"], 1.)
+        row.update({key: metrics[key] / count for key, count in audit_examples.items()})
         row.update({f"parameter_update_norm/{key}": value / update_audits for key, value in update_norms.items()})
         row.update({key: value for key, value in metrics.items() if key.startswith("kd_coverage/")})
         row["parameter_update_audits"] = update_audits

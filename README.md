@@ -4,6 +4,8 @@
 批量实验入口见 [实验计划与审计](docs/EXPERIMENTS.md)，实现与边界见 [COSD](docs/COSD.md)，运行命令见 [生理参考与评估](docs/EVALUATION.md)，
 完整迭代状态见 [开发记录](docs/DEVELOPMENT_PLAN.md)。Python 包名保持 `tempobridge`。
 
+V3-A/B 增加 PPG 脉搏事件、ECG RR 分布和同记录相邻窗口的动态监督。原始采样率参考表、训练和评估命令见 [V3 事件迁移](docs/V3_EVENT_TRANSFER.md)。
+
 **ECG 辅助训练、PPG 单模态推理的可观测教师目标研究基座。**
 
 TempoBridge 实现一条可以执行和审计的研究路线：先学习 PPG 本身的表示，

@@ -1,0 +1,13 @@
+{
+  "model": {"encoder": "selective", "dropout": 0.1},
+  "data": {"window_mode": "full", "sampler": "patient"},
+  "train": {
+    "transfer_method": "none",
+    "transfer_mode": "none",
+    "device": "cpu",
+    "batch_size": 4,
+    "accumulation": 8,
+    "checkpoint_selection": "last",
+    "gradient_audit_interval": 50
+  }
+}

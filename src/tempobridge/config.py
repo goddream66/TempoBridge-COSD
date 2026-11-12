@@ -183,14 +183,62 @@ class COSDConfig:
 
 
 @dataclass
+class EventTransferConfig:
+    hidden_dim: int = 128
+    foot_weight: float = 1.0
+    peak_weight: float = 1.0
+    quality_proxy_weight: float = 0.1
+    rr_weight: float = 1.0
+    rr_loss: str = "gaussian"
+    rr_anchor_mode: str = "reference"
+    rr_anchor_threshold: float = 0.5
+    rr_anchor_tolerance_s: float = 0.08
+    rr_anchor_ramp_epochs: int = 5
+    dynamic_weight: float = 0.0
+    dynamic_target: str = "metrics"
+    dynamic_metrics: list[str] = field(default_factory=lambda: ["hr_bpm", "rmssd_ms"])
+    rmssd_reference: str = "nn_only"
+    minimum_quality: float = 0.2
+    delay_min_s: float = 0.04
+    delay_max_s: float = 0.45
+    pair_tolerance_s: float = 0.02
+
+    def validate(self):
+        if type(self.hidden_dim) is not int or self.hidden_dim < 4:
+            raise ValueError("Event hidden_dim must be an integer >=4")
+        weights = (self.foot_weight, self.peak_weight, self.quality_proxy_weight,
+                   self.rr_weight, self.dynamic_weight)
+        if not any(weights) or any(not 0 <= value < float("inf") for value in weights):
+            raise ValueError("Event loss weights must be finite, nonnegative and not all zero")
+        if self.rr_loss not in {"gaussian", "huber"} or self.dynamic_target not in {"metrics", "latent"}:
+            raise ValueError("Unknown RR loss or dynamic target")
+        if self.rr_anchor_mode not in {"reference", "predicted", "mixed"} or not 0 < self.rr_anchor_threshold < 1:
+            raise ValueError("Invalid RR anchor mode or event threshold")
+        if (not 0 < self.rr_anchor_tolerance_s <= .25 or type(self.rr_anchor_ramp_epochs) is not int
+                or self.rr_anchor_ramp_epochs < 1):
+            raise ValueError("Invalid RR anchor tolerance or ramp length")
+        if self.rmssd_reference not in {"nn_only", "allow_rr_proxy"}:
+            raise ValueError("Unknown RMSSD reference policy")
+        if (not self.dynamic_metrics or len(set(self.dynamic_metrics)) != len(self.dynamic_metrics)
+                or not set(self.dynamic_metrics) <= {"hr_bpm", "rmssd_ms"}):
+            raise ValueError("Use distinct ECG dynamic targets: hr_bpm and/or rmssd_ms")
+        if not 0 <= self.minimum_quality <= 1 or not 0 <= self.pair_tolerance_s <= .1:
+            raise ValueError("Invalid event quality or window-pair tolerance")
+        if not 0 < self.delay_min_s < self.delay_max_s <= 1:
+            raise ValueError("Invalid ECG to PPG delay bounds")
+
+
+@dataclass
 class ExperimentConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     data: DataConfig = field(default_factory=DataConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
     cosd: COSDConfig = field(default_factory=COSDConfig)
+    event: EventTransferConfig = field(default_factory=EventTransferConfig)
 
     def validate(self):
+        self.event.validate()
         d, t, c = self.data, self.train, self.calibration
         if d.ppg_fs <= 0 or d.ecg_fs <= 0 or d.workers < 0:
             raise ValueError("Invalid sample rates/workers")
@@ -299,7 +347,7 @@ class ExperimentConfig:
 
     @classmethod
     def from_dict(cls, values):
-        unknown = set(values) - {"model", "data", "train", "calibration", "cosd"}
+        unknown = set(values) - {"model", "data", "train", "calibration", "cosd", "event"}
         if unknown:
             raise ValueError(f"Unknown config sections: {unknown}")
         model = ModelConfig.from_dict(values["model"]) if "model" in values else ModelConfig()
@@ -310,12 +358,16 @@ class ExperimentConfig:
             data = DataConfig.from_dict({})
         else:
             data = DataConfig()
+        event = dict(values.get("event", {}))
+        if "confidence_weight" in event:
+            event.setdefault("quality_proxy_weight", event.pop("confidence_weight"))
         return cls(
             model=model,
             data=data,
             train=TrainConfig(**values.get("train", {})),
             calibration=CalibrationConfig(**values.get("calibration", {})),
             cosd=COSDConfig(**values.get("cosd", {})),
+            event=EventTransferConfig(**event),
         ).validate()
 
     @classmethod

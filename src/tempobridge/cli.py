@@ -84,6 +84,33 @@ def main(argv=None):
     p = sub.add_parser("reference-targets", help="Extract masked heuristic targets from independent native-rate reference windows")
     p.add_argument("--references", required=True, help="JSONL: sample_id,path,duration_seconds; NPZ with ECG/ABP/RESP")
     p.add_argument("--output", required=True, help="Long-format target CSV")
+    p = sub.add_parser("event-targets", help="Extract native-rate V3 beat references into HDF5")
+    for name in ("references", "manifest", "config", "output"):
+        p.add_argument("--" + name, required=True)
+    p.add_argument("--annotations", help="Optional independent native event annotations (JSONL)")
+    p = sub.add_parser("audit-events", help="Compare native references, model-input events and manual labels")
+    for name in ("manifest", "event-targets", "config", "output"):
+        p.add_argument("--" + name, required=True)
+    p.add_argument("--manual-targets", help="Optional schema-2 HDF5 containing annotated events")
+    p.add_argument("--split", choices=["all", "train", "val", "test"], default="all")
+    p.add_argument("--max-per-source", type=int, default=500)
+    p.add_argument("--tolerance-s", type=float, default=.08)
+    p.add_argument("--seed", type=int, default=42)
+    p = sub.add_parser("train-events", help="Continue PPG SSL with V3 event and optional dynamics losses")
+    for name in ("manifest", "config", "event-targets", "student", "output"):
+        p.add_argument("--" + name, required=True)
+    p.add_argument("--teacher", help="Frozen ECG checkpoint for latent dynamics only")
+    p.add_argument("--teacher-kind", choices=["native", "torchscript", "random_control"], default="native")
+    p.add_argument("--resume")
+    p.add_argument("--stop-after", type=int)
+    p = sub.add_parser("evaluate-events", help="Score PPG-only event predictions on held-out windows")
+    for name in ("checkpoint", "manifest", "event-targets", "output"):
+        p.add_argument("--" + name, required=True)
+    p.add_argument("--split", choices=["val", "test"], default="test")
+    p.add_argument("--device", default="cpu")
+    p.add_argument("--threshold", type=float)
+    p.add_argument("--tolerance-s", type=float, default=.08)
+    p.add_argument("--require-manual", action="store_true", help="Use only independently annotated windows")
     for name in ("pretrain", "distill", "calibrate", "cache-features"):
         p = sub.add_parser(name)
         p.add_argument("--config", required=True)
@@ -170,6 +197,22 @@ def main(argv=None):
     elif args.command == "reference-targets":
         from .physio_targets import build_reference_targets
         result = build_reference_targets(args.references, args.output)
+    elif args.command == "event-targets":
+        from .event_targets import build_event_targets
+        result = build_event_targets(args.references, args.manifest, ExperimentConfig.load(args.config), args.output,
+                                     args.annotations)
+    elif args.command == "audit-events":
+        from .event_audit import audit_events
+        result = audit_events(args.manifest, args.event_targets, ExperimentConfig.load(args.config), args.output,
+                              args.manual_targets, args.split, args.max_per_source, args.tolerance_s, args.seed)
+    elif args.command == "train-events":
+        result = train(ExperimentConfig.load(args.config), args.manifest, args.output, student_path=args.student,
+                       teacher_path=args.teacher, teacher_kind=args.teacher_kind, resume=args.resume,
+                       stop_after=args.stop_after, event_targets_path=args.event_targets)
+    elif args.command == "evaluate-events":
+        from .event_evaluation import evaluate_events
+        result = evaluate_events(args.checkpoint, args.manifest, args.event_targets, args.output,
+                                 args.split, args.device, args.threshold, args.tolerance_s, args.require_manual)
     elif args.command == "preprocess":
         from .preprocess import PreprocessConfig, preprocess_raw
         config = PreprocessConfig(**{name: getattr(args, name) for name in PreprocessConfig.__dataclass_fields__})

@@ -23,6 +23,28 @@ FIELDS = ["sample_id", "target", "value", "valid", "reason", "units", "reference
           "method", "reference_sha256", "reference_fs", "duration_seconds"]
 
 
+def ecg_peak_candidates(wave, fs):
+    """Heuristic QRS-energy detections refined on the bandpassed ECG."""
+    filtered = sosfiltfilt(butter(3, [5., min(25., .4 * fs)], fs=fs, btype="band", output="sos"), wave)
+    width = max(1, round(.08 * fs))
+    energy = np.convolve(filtered ** 2, np.ones(width) / width, mode="same")
+    peaks, _ = find_peaks(energy, distance=max(1, round(.25 * fs)), prominence=max(energy.std() * .5, 1e-12))
+    radius = max(1, round(.06 * fs))
+    return np.unique([max(0, p - radius) + np.argmax(abs(filtered[max(0, p - radius):p + radius + 1]))
+                      for p in peaks]).astype(int)
+
+
+def ecg_interval_metrics(intervals, valid, fs, duration):
+    """Return window-level proxies using only the eligible RR intervals."""
+    if len(intervals) < 4 or valid.mean() < .8:
+        return None, None
+    hr = float(60 / np.median(intervals[valid]))
+    pairs = valid[:-1] & valid[1:]
+    rmssd = (float(1000 * np.sqrt(np.mean(np.diff(intervals)[pairs] ** 2)))
+             if fs >= 100 and duration >= 30 and pairs.sum() >= 20 else None)
+    return hr, rmssd
+
+
 def reference_targets(signals, duration):
     """NPZ keys: ecg/ecg_fs, abp/abp_fs/abp_units='mmHg', resp/resp_fs.
 
@@ -70,23 +92,13 @@ def reference_targets(signals, duration):
             for name in ("hr_bpm", "rmssd_ms"):
                 output[name]["reason"] = "insufficient_ecg_rate_or_duration"
         else:
-            filtered = sosfiltfilt(butter(3, [5., min(25., .4 * fs)], fs=fs, btype="band", output="sos"), wave)
-            width = max(1, round(.08 * fs))
-            energy = np.convolve(filtered ** 2, np.ones(width) / width, mode="same")
-            peaks, _ = find_peaks(energy, distance=max(1, round(.25 * fs)), prominence=max(energy.std() * .5, 1e-12))
-            # Energy smoothing locates QRS regions, not precise R events. Refine
-            # against absolute bandpassed ECG before deriving RR differences.
-            radius = max(1, round(.06 * fs))
-            peaks = np.unique([max(0, p - radius) + np.argmax(abs(filtered[max(0, p - radius):p + radius + 1]))
-                               for p in peaks]).astype(int)
-            intervals = np.diff(peaks) / fs
+            intervals = np.diff(ecg_peak_candidates(wave, fs)) / fs
             plausible = (intervals >= .27) & (intervals <= 2.4)
-            if len(intervals) >= 4 and plausible.mean() >= .8:
-                assign("hr_bpm", 60 / np.median(intervals[plausible]))
-                # Never bridge rejected beats when computing adjacent RR differences.
-                pairs = plausible[:-1] & plausible[1:]
-                if fs >= 100 and duration >= 30 and pairs.sum() >= 20:
-                    assign("rmssd_ms", 1000 * np.sqrt(np.mean(np.diff(intervals)[pairs] ** 2)))
+            hr, rmssd = ecg_interval_metrics(intervals, plausible, fs, duration)
+            if hr is not None:
+                assign("hr_bpm", hr)
+                if rmssd is not None:
+                    assign("rmssd_ms", rmssd)
                 else:
                     output["rmssd_ms"]["reason"] = "insufficient_native_rate_duration_or_rr_pairs"
 
